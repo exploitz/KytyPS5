@@ -16,7 +16,9 @@ New-Item -ItemType Directory -Force $out | Out-Null
 
 $params = @{ Label = $Label; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = $StartupSeconds }
 if ($Exe) { $params['Exe'] = $Exe }
-if ($Set.Count) { $params['Set'] = $Set }
+# bench-run.ps1 presses J (Cross) and Enter (Options) through the menus: chen's keys, KYTY_KEYBOARD_LAYOUT=classic in
+# this fork's PC layout (a build without the switch ignores it).
+$params['Set'] = @('KYTY_KEYBOARD_LAYOUT=classic') + $Set
 if ($Extra.Count) { $params['Extra'] = $Extra }
 if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
 if ($NoPrecompile) { $params['NoPrecompile'] = $true }
