@@ -23,9 +23,11 @@
 #include "frame-capture.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "live-shot.h"
 #include "live-trace.h"
 #include "libs/controller.h"
 #include "loader/demonsSoulsWarp.h"
+#include "kernel/pthread.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #include "slow-log.h"
@@ -429,9 +431,15 @@ inline void Run(uint64_t id, const std::string& line) {
 			LiveTrace::g_read_marks(std::min(LiveTrace::g_mark_next.load(), LiveTrace::MarkSlots));
 		LiveTrace::Dump(arg2);
 		const double seconds = std::chrono::duration<double>(clock1 - clock0).count();
-		std::printf("LIVE_TRACE id=%" PRIu64 " records=%" PRIu64 " tsc_hz=%.0f path=%s\n", id,
+		uint64_t trace_base = 0;
+		char     trace_exe[512] {};
+#if defined(_WIN32)
+		if (!LocalPlatform::ModuleOf(reinterpret_cast<const void*>(&Flip), &trace_base, trace_exe, sizeof(trace_exe)))
+			trace_exe[0] = '\0';
+#endif
+		std::printf("LIVE_TRACE id=%" PRIu64 " records=%" PRIu64 " tsc_hz=%.0f path=%s base=%016" PRIx64 " exe=%s\n", id,
 		            std::min<uint64_t>(LiveTrace::g_count.load(), LiveTrace::Capacity),
-		            static_cast<double>(tsc1 - tsc0) / seconds, arg2);
+		            static_cast<double>(tsc1 - tsc0) / seconds, arg2, trace_base, trace_exe[0] != '\0' ? trace_exe : "?");
 	} else if (cmd == "census" && n >= 2) {
 		// census <seconds>: render-thread time per call kind and shader over the window.
 		LiveCensus::g_on.store(false);
@@ -539,6 +547,12 @@ inline void Run(uint64_t id, const std::string& line) {
 				std::printf("LIVE_PM4 id=%" PRIu64 " opcode=0x%02zx per_frame=%.2f\n", id, i,
 				            static_cast<double>(count) / static_cast<double>(frames));
 		}
+	} else if (cmd == "prio" && n >= 3) {
+		// prio <gpu 0|1|2> <band old|low>: the GPU thread's priority (Windows THREAD_PRIORITY_* value) and
+		// the guest priority band (upstream #1050) at run time, for paired A/B in one session.
+		const bool gpu  = LocalPlatform::SetThreadHandlePriority(g_render_thread, std::atoi(arg1));
+		const int  band = Libs::LibKernel::PthreadApplyGuestPriorityBand(std::string_view(arg2) == "low");
+		std::printf("LIVE_PRIO id=%" PRIu64 " gpu=%s(%d) band=%s threads=%d\n", id, arg1, gpu ? 1 : 0, arg2, band);
 	} else if (cmd == "pin" && n >= 2) {
 		// pin <cpus>: the render thread's affinity (for same-process placement A/B).
 		const bool ok = LocalPlatform::PinThreadHandleToCpuList(g_render_thread, arg1);
@@ -554,6 +568,9 @@ inline void Run(uint64_t id, const std::string& line) {
 		const int result = __llvm_profile_write_file();
 		std::printf("LIVE_PGO id=%" PRIu64 " path=%s result=%d\n", id, arg1, result);
 #endif
+	} else if (cmd == "shot" && n >= 2) {
+		// shot <path>: the next presented frame as a BMP (live-shot.h); LIVE_SHOT once written.
+		LiveShot::Request(id, arg1);
 	} else if (cmd == "vma" && n >= 2) {
 		// vma <path>: the GPU allocator's detailed statistics (JSON: every allocation's type and size).
 		if (LiveCounters::g_vma_report != nullptr) LiveCounters::g_vma_report(arg1);
@@ -572,6 +589,10 @@ inline void Run(uint64_t id, const std::string& line) {
 		const bool ok    = LocalPlatform::WriteHeapHistogram(arg1);
 		std::printf("LIVE_HEAPSTATS id=%" PRIu64 " path=%s written=%d ms=%.0f\n", id, arg1, ok ? 1 : 0,
 		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	} else if (cmd == "mem" && n >= 2) {
+		// mem <path>: the process's address space by kind (LocalPlatform::WriteAddressSpaceCensus): what the RAM holds.
+		const bool ok = LocalPlatform::WriteAddressSpaceCensus(arg1);
+		std::printf("LIVE_MEM id=%" PRIu64 " path=%s written=%d\n", id, arg1, ok ? 1 : 0);
 	} else if (cmd == "alloctrace" && n >= 2) {
 		// alloctrace start <sizes,...> | dump <path>: live heap blocks of those sizes by stack (LocalPlatform::StartAllocTrace).
 		const bool start = std::string_view(arg1) == "start";
@@ -600,6 +621,26 @@ inline void Run(uint64_t id, const std::string& line) {
 		                     : n == 3 && Loader::DemonsSoulsWarp::Arm(arg1, arg2);
 		std::printf("LIVE_WARP id=%" PRIu64 " map=%s spawn=%s ok=%d spawns=%zu\n", id, arg1, n == 3 ? arg2 : "-",
 		            ok ? 1 : 0, Loader::DemonsSoulsWarp::Spawns().size());
+	} else if (cmd == "pos") {
+		// pos: the player's position and yaw now (none: no player).
+		float xyz[3] {}, yaw = 0;
+		if (Loader::DemonsSoulsWarp::PlayerPosition(xyz, &yaw))
+			std::printf("LIVE_POS id=%" PRIu64 " x=%.2f y=%.2f z=%.2f yaw=%.3f\n", id, xyz[0], xyz[1], xyz[2], yaw);
+		else
+			std::printf("LIVE_POS id=%" PRIu64 " none\n", id);
+	} else if (cmd == "spawns" && n >= 2) {
+		// spawns <path>: every map's spawn points ("map name x y z yaw" lines): routes for glide tours are made from them.
+		FILE* f = std::fopen(arg1, "w");
+		size_t count = 0;
+		if (f != nullptr) {
+			for (const auto& spawn: Loader::DemonsSoulsWarp::Spawns()) {
+				std::fprintf(f, "%s %s %.2f %.2f %.2f %.1f\n", spawn.map.c_str(), spawn.name.c_str(), spawn.x, spawn.y, spawn.z,
+				             spawn.yaw);
+				count++;
+			}
+			std::fclose(f);
+		}
+		std::printf("LIVE_SPAWNS id=%" PRIu64 " path=%s count=%zu\n", id, arg1, count);
 	} else if (cmd == "glide") {
 		// glide X Y Z SPEED: the player walked there in a straight line (loader/demonsSoulsWarp.h), at once; seconds = the
 		// time it takes (-1: no player).
@@ -698,6 +739,54 @@ inline void StallWatch(int64_t threshold_ns) {
 		std::fflush(stdout);
 	}
 }
+
+// KYTY_FRAME_DUMP_MS: a frame of the render thread running that long past the last flip, while it is not idle (the
+// game submits; it is the emulator that stalls), has the Kyty.* threads sampled (the render thread first): FRAMESTALL
+// lines, host code as addresses for the build's map. Three dumps a frame at most, 300 ms apart.
+inline void FrameStallWatch(int64_t threshold_ns) {
+	LocalPlatform::SetThreadName("Kyty.FrameWatch");
+	uint64_t last_flip = 0;
+	int      dumps     = 0;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		const auto flips = g_flips.load(std::memory_order_acquire);
+		if (flips < 60) continue;
+		if (flips != last_flip) {
+			last_flip = flips;
+			dumps     = 0;
+		}
+		const int64_t last = g_flip_times[(flips - 1) % FlipTimes].load(std::memory_order_relaxed);
+		const int64_t now  = std::chrono::steady_clock::now().time_since_epoch().count();
+		if (dumps >= 3 || now - last < threshold_ns + dumps * int64_t {300'000'000}) continue;
+		if (g_render_idle_since.load(std::memory_order_relaxed) != 0) continue; // (the game's wait: StallWatch's case)
+		++dumps;
+		LocalPlatform::PrepareSampling();
+		const auto  self = LocalPlatform::ThreadId();
+		std::string out;
+		char        line[160];
+		std::snprintf(line, sizeof(line), "FRAMESTALL %.0f ms since the last flip (dump %d)\n", static_cast<double>(now - last) / 1e6, dumps);
+		out += line;
+		for (const auto& [tid, name]: LocalPlatform::ProcessThreads()) {
+			if (tid == self || name.rfind("Kyty.", 0) != 0 || name == "Kyty.FrameWatch") continue;
+			const auto handle = LocalPlatform::OpenThreadForSampling(tid);
+			if (handle == 0) continue;
+			uint64_t   words[SampleWords] {};
+			const bool sampled = LocalPlatform::SampleThread(handle, 0, 0, words, SampleWords);
+			LocalPlatform::CloseThreadForSampling(handle);
+			if (!sampled) continue;
+			std::snprintf(line, sizeof(line), "FRAMESTALL   %u %s:", tid, name.c_str());
+			out += line;
+			for (const auto word: words) {
+				if (word == 0) break;
+				std::snprintf(line, sizeof(line), " %llx", static_cast<unsigned long long>(word));
+				out += line;
+			}
+			out += "\n";
+		}
+		std::fputs(out.c_str(), stdout);
+		std::fflush(stdout);
+	}
+}
 #endif
 
 inline void Start() {
@@ -710,6 +799,8 @@ inline void Start() {
 #if defined(_WIN32)
 	if (const char* stall = std::getenv("KYTY_STALL_DUMP_MS"); stall != nullptr && std::atoi(stall) > 0)
 		std::thread(StallWatch, int64_t {std::atoi(stall)} * 1'000'000).detach();
+	if (const char* frame = std::getenv("KYTY_FRAME_DUMP_MS"); frame != nullptr && std::atoi(frame) > 0)
+		std::thread(FrameStallWatch, int64_t {std::atoi(frame)} * 1'000'000).detach();
 #endif
 	static const char* const path = std::getenv("KYTY_LIVE_FILE");
 	if (path == nullptr) return;

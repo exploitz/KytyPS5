@@ -293,10 +293,17 @@ public:
 	struct PrefetchProgress {
 		size_t      done = 0, total = 0;
 		const char* label = nullptr; // a warmup beside the game's phase (null: the prefetch's progress)
+		size_t      adding = 0;      // of `total`, programs the store lacks, translated and added to it
 	};
 	// Stops a warmup still running beside the game, and waits for it (the window's close; not under m_mutex).
 	void StopWarmup();
 	[[nodiscard]] PrefetchProgress GetPrefetchProgress() const;
+	// Pipelines the compile workers are building now (async table and native ones, optimized builds): the HUD says so
+	// while play meets them (10-15: a new game's hitches showed nothing on screen). Any thread.
+	[[nodiscard]] uint32_t PipelinesBuilding() const {
+		const auto n = m_pipelines_building.load(std::memory_order_relaxed);
+		return n > 0 ? static_cast<uint32_t>(n) : 0;
+	}
 
 private:
 	struct ProgramCache;
@@ -411,6 +418,7 @@ private:
 	std::vector<vk::Pipeline> m_replaced_pipelines;
 	uint32_t                  m_unoptimized_builds = 0;
 	std::atomic<uint32_t>     m_optimized_builds {0}; // finished by workers
+	std::atomic<int32_t>      m_pipelines_building {0}; // handed to workers, less done (PipelinesBuilding)
 	uint32_t                  m_promoted_builds = 0;  // of those, seen by PromoteOptimized
 	std::atomic<bool>         m_stopping {false};     // optimized builds not started yet are skipped
 	// Table mode pipelines' driver cache (InitializeDriverCache), saved by m_table_cache_saver once their compiles

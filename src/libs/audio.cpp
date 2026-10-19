@@ -10,6 +10,7 @@
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "libs/audio_internal.h"
+#include "audio-probe.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -21,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "libatrac9.h"
@@ -90,6 +93,7 @@ public:
 	bool     AudioOutClose(Id handle);
 	bool     AudioOutValid(Id handle);
 	bool     AudioOutHasDevice(Id handle);
+	uint64_t AudioOutQueuedMicros(Id handle);
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
@@ -114,6 +118,7 @@ private:
 
 		SDL_AudioDeviceID audio_device = 0;
 		SDL_AudioSpec     audio_spec   = {};
+		int               index        = -1; // in m_out_ports (the audio probe's port)
 	};
 
 	struct PortIn {
@@ -164,6 +169,10 @@ void AudioOutClose(int handle) {
 
 bool AudioOutHasDevice(int handle) {
 	return g_audio != nullptr && handle > 0 && g_audio->AudioOutHasDevice(Audio::Id(handle));
+}
+
+uint64_t AudioOutQueuedMicros(int handle) {
+	return g_audio != nullptr && handle > 0 ? g_audio->AudioOutQueuedMicros(Audio::Id(handle)) : 0;
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
@@ -226,8 +235,37 @@ uint32_t Audio::BytesPerSample(Format format) {
 	return FormatIsFloat(format) ? sizeof(float) : sizeof(int16_t);
 }
 
+// A 7.1 port on an output that is not 7.1 itself opens a stereo device and is folded down here
+// (DownmixesToStereo): the centre, where a 7.1 stem keeps its dialogue (the movies' voice-over streams
+// are 7.1), at -3 dB in both sides. Opened as 8 channels, the centre reached Windows as a channel of
+// its own, and an output that plays only a front pair dropped the voices. The output's own channel
+// count is what the default device reports (SDL_GetDefaultAudioInfo: its mix format on WASAPI).
+// KYTY_AUDIO_STEREO=1 folds down always, =0 never.
+static bool ForceStereo() {
+	static const bool force = [] {
+		if (const char* value = std::getenv("KYTY_AUDIO_STEREO"); value != nullptr && *value != '\0') {
+			return value[0] == '1';
+		}
+		char*         name = nullptr;
+		SDL_AudioSpec spec {};
+		if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0 || SDL_GetDefaultAudioInfo(&name, &spec, 0) != 0) {
+			std::printf("AudioOut: the default output's format is unknown (%s): 7.1 played as 7.1\n", SDL_GetError());
+			std::fflush(stdout);
+			return false;
+		}
+		const bool stereo = spec.channels <= 2;
+		std::printf("AudioOut: default output \"%s\" takes %u channels: 7.1 %s\n", name != nullptr ? name : "?",
+		            static_cast<unsigned>(spec.channels), stereo ? "folded to stereo here" : "played as 7.1");
+		std::fflush(stdout);
+		SDL_free(name);
+		return stereo;
+	}();
+	return force;
+}
+
 uint32_t Audio::OutputChannels(const PortOut& port) {
 	// SDL only takes up to 8 channels. Keep the guest buffer's channel count separate.
+	if (ForceStereo() && port.channels_num >= 8) return 2; // the ports DownmixesToStereo folds
 	return std::min(port.channels_num, 8);
 }
 
@@ -313,8 +351,9 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 
 	SDL_AudioSpec obtained {};
 
-	port->audio_device =
-	    SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
+	// A forced stereo device keeps its two channels (SDL then converts to whatever the endpoint takes).
+	const int allowed  = ForceStereo() ? (SDL_AUDIO_ALLOW_ANY_CHANGE & ~SDL_AUDIO_ALLOW_CHANNELS_CHANGE) : SDL_AUDIO_ALLOW_ANY_CHANGE;
+	port->audio_device = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, allowed);
 	if (port->audio_device == 0) {
 		LOGF("AudioOut: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
 		return false;
@@ -585,6 +624,44 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 		}
 	}
 
+	// KYTY_AUDIO_PROBE (audio-probe.h): the main ports' buffers, as the device gets them.
+	if (port->type == AUDIO_OUT_PORT_TYPE_MAIN && AudioProbe::Control() != nullptr) {
+		const uint64_t bytes_per_second = static_cast<uint64_t>(SDL_AUDIO_BITSIZE(port->audio_spec.format) / 8) *
+		                                  port->audio_spec.channels * static_cast<uint64_t>(port->audio_spec.freq);
+		const uint64_t queued_us =
+		    bytes_per_second != 0 ? SDL_GetQueuedAudioSize(port->audio_device) * 1000000ULL / bytes_per_second : 0;
+		AudioProbe::NoteOutput(port->index, queue_data, queue_size, SDL_AUDIO_ISFLOAT(port->audio_spec.format),
+		                       queued_us);
+	}
+
+	// KYTY_AUDIO_DUMP=<file> (local diagnostic): the first main port's bytes as the device gets them, appended raw to
+	// <file> (up to 512 MiB), its format in <file>.txt (to hear or analyze what the game played, e.g. static).
+	if (port->type == AUDIO_OUT_PORT_TYPE_MAIN) {
+		static const char* const dump_path = std::getenv("KYTY_AUDIO_DUMP");
+		static std::mutex        dump_mutex;
+		static FILE*             dump_file  = nullptr;
+		static int               dump_port  = -1;
+		static uint64_t          dump_bytes = 0;
+		if (dump_path != nullptr && *dump_path != '\0') {
+			std::lock_guard lock(dump_mutex);
+			if (dump_port < 0) {
+				dump_port = port->index;
+				dump_file = std::fopen(dump_path, "wb");
+				if (FILE* info = std::fopen((std::string(dump_path) + ".txt").c_str(), "w")) {
+					std::fprintf(info, "freq=%d channels=%d bits=%d float=%d\n", port->audio_spec.freq,
+					             static_cast<int>(port->audio_spec.channels), static_cast<int>(SDL_AUDIO_BITSIZE(port->audio_spec.format)),
+					             SDL_AUDIO_ISFLOAT(port->audio_spec.format) ? 1 : 0);
+					std::fclose(info);
+				}
+			}
+			if (dump_file != nullptr && dump_port == port->index && dump_bytes < (uint64_t {512} << 20u)) {
+				std::fwrite(queue_data, 1, queue_size, dump_file);
+				std::fflush(dump_file);
+				dump_bytes += queue_size;
+			}
+		}
+	}
+
 	if (SDL_QueueAudio(port->audio_device, queue_data, queue_size) < 0) {
 		LOGF("AudioOut: SDL_QueueAudio failed: %s\n", SDL_GetError());
 		return false;
@@ -603,6 +680,7 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			auto& port = m_out_ports[id];
 
 			port.used             = true;
+			port.index            = id;
 			port.type             = type;
 			port.samples_num      = samples_num;
 			port.freq             = freq;
@@ -683,6 +761,17 @@ bool Audio::AudioOutHasDevice(Id handle) {
 
 	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
 	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].audio_device != 0);
+}
+
+uint64_t Audio::AudioOutQueuedMicros(Id handle) {
+	Common::LockGuard lock(m_mutex);
+
+	if (handle.GetId() < 0 || handle.GetId() >= OUT_PORTS_MAX) return 0;
+	const auto& port = m_out_ports[handle.GetId()];
+	if (!port.used || port.audio_device == 0) return 0;
+	const uint64_t bytes_per_second = static_cast<uint64_t>(SDL_AUDIO_BITSIZE(port.audio_spec.format) / 8) *
+	                                  port.audio_spec.channels * static_cast<uint64_t>(port.audio_spec.freq);
+	return bytes_per_second != 0 ? SDL_GetQueuedAudioSize(port.audio_device) * 1000000ULL / bytes_per_second : 0;
 }
 
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {
@@ -1124,6 +1213,17 @@ struct AcmBatchError {
 static std::atomic_uint32_t g_acm_next_context {1};
 static std::atomic_uint32_t g_acm_next_batch {1};
 
+// The first call of each ACM entry point is reported on the console: every operation here records
+// nothing and executes nothing (the outputs keep whatever they held), so which of them a game uses
+// tells whether its audio depends on them (the missing voices in Demon's Souls movies, 2026-10-05).
+static void acm_first_call(std::atomic_bool& seen, const char* name, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0) {
+	if (!seen.exchange(true, std::memory_order_relaxed)) {
+		std::printf("Acm: first %s (%llu, %llu, %llu)\n", name, static_cast<unsigned long long>(a), static_cast<unsigned long long>(b),
+		            static_cast<unsigned long long>(c));
+		std::fflush(stdout);
+	}
+}
+
 static void acm_advance_batch(AcmBatchInfo* info, size_t bytes) {
 	if (info == nullptr || info->buffer == nullptr || info->buffer_size == 0) {
 		return;
@@ -1133,6 +1233,8 @@ static void acm_advance_batch(AcmBatchInfo* info, size_t bytes) {
 }
 
 int KYTY_SYSV_ABI AcmContextCreate(AcmContextId* context) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmContextCreate");
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(context == nullptr);
@@ -1153,6 +1255,8 @@ int KYTY_SYSV_ABI AcmContextDestroy(AcmContextId context) {
 int KYTY_SYSV_ABI AcmBatchStartBuffer(AcmContextId context, const void* batch_commands,
                                       size_t batch_size, AcmBatchError* batch_error,
                                       AcmBatchId* batch) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmBatchStartBuffer", batch_size);
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(batch == nullptr);
@@ -1169,6 +1273,8 @@ int KYTY_SYSV_ABI AcmBatchStartBuffer(AcmContextId context, const void* batch_co
 int KYTY_SYSV_ABI AcmBatchStartBuffers(AcmContextId context, uint32_t batch_info_count,
                                        const AcmBatchInfo* const batch_info[],
                                        AcmBatchError* batch_error, AcmBatchId* batch) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmBatchStartBuffers", batch_info_count);
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(batch_info_count != 0 && batch_info == nullptr);
@@ -1184,10 +1290,14 @@ int KYTY_SYSV_ABI AcmBatchStartBuffers(AcmContextId context, uint32_t batch_info
 }
 
 int KYTY_SYSV_ABI AcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t timeout) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmBatchWait");
 	return OK;
 }
 
 int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmBatchJobNotification");
 	PRINT_NAME();
 	acm_advance_batch(batch_info, 2 * 16);
 	return OK;
@@ -1196,6 +1306,8 @@ int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info) {
 int KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t block_count, void* in,
                                            uint32_t count, const void* const ir[],
                                            const float* gain, void* const out[]) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmConvReverbSharedInput", block_count, count);
 	PRINT_NAME();
 	(void)block_count;
 	(void)in;
@@ -1210,6 +1322,8 @@ int KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t bl
 int KYTY_SYSV_ABI AcmConvReverbSharedIr(AcmBatchInfo* batch_info, uint32_t block_count,
                                         const void* ir, uint32_t count, void* const in[],
                                         const float* gain, void* const out[]) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmConvReverbSharedIr", block_count, count);
 	PRINT_NAME();
 	(void)block_count;
 	(void)ir;
@@ -1224,6 +1338,8 @@ int KYTY_SYSV_ABI AcmConvReverbSharedIr(AcmBatchInfo* batch_info, uint32_t block
 int KYTY_SYSV_ABI AcmFft(AcmBatchInfo* batch_info, int size, int count, int input_format,
                          const void* const input[], int output_format, void* const output[],
                          uint32_t flags) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmFft", static_cast<uint64_t>(size), static_cast<uint64_t>(count));
 	PRINT_NAME();
 	(void)size;
 	(void)count;
@@ -1239,6 +1355,8 @@ int KYTY_SYSV_ABI AcmFft(AcmBatchInfo* batch_info, int size, int count, int inpu
 int KYTY_SYSV_ABI AcmIfft(AcmBatchInfo* batch_info, int size, int count, int input_format,
                           const void* const input[], int output_format, void* const output[],
                           uint32_t flags) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmIfft", static_cast<uint64_t>(size), static_cast<uint64_t>(count));
 	PRINT_NAME();
 	(void)size;
 	(void)count;
@@ -1255,6 +1373,8 @@ int KYTY_SYSV_ABI AcmPanner(AcmBatchInfo* batch_info, uint32_t in_count, const f
                             uint32_t biquad_count, uint32_t biquad_update_count, uint32_t out_count,
                             const void* const parameter[], void* const state[],
                             const float* const out_init[], float* const out[]) {
+	static std::atomic_bool s_seen {false};
+	acm_first_call(s_seen, "AcmPanner", in_count, out_count, biquad_count);
 	PRINT_NAME();
 	(void)in_count;
 	(void)in;

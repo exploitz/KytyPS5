@@ -1,6 +1,9 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
+
+#include <atomic>
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
@@ -339,16 +342,42 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const bool mapping_valid =
 	    IsComponentSwizzle(normalized.mapping.r) && IsComponentSwizzle(normalized.mapping.g) &&
 	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
-	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
+	if (image.image == nullptr) {
+		EXIT("invalid image view: no image (format=%d type=%d)\n", static_cast<int>(image.format),
+		     static_cast<int>(normalized.type));
+	}
+	if (!format_compatible || !ranges_valid || !mapping_valid ||
 	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
-		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
-		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
-		     static_cast<int>(image.format), static_cast<int>(normalized.format),
-		     static_cast<int>(normalized.type),
-		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
-		     normalized.level_count, normalized.base_layer, normalized.layer_count,
-		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
-		     image.layers);
+		// A descriptor that does not fit the image the cache holds at its address (a 3D view of a
+		// 2D render target, a level or layer range past the image, a format of another class):
+		// the hardware would sample garbage; we sample the image's own shape instead of exiting.
+		static std::atomic<uint32_t> reported {0};
+		if (const auto n = reported.fetch_add(1, std::memory_order_relaxed) + 1; (n & (n - 1)) == 0) {
+			LOGF("Image: %u incompatible view(s) replaced by the image's own shape (last: image_format=%d "
+			     "view_format=%d type=%d aspect=0x%x mip=%u+%u layer=%u+%u image_type=%d image_levels=%u "
+			     "image_layers=%u)\n",
+			     n, static_cast<int>(image.format), static_cast<int>(normalized.format),
+			     static_cast<int>(normalized.type),
+			     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
+			     normalized.level_count, normalized.base_layer, normalized.layer_count,
+			     static_cast<int>(image.image_type), image.mip_levels, image.layers);
+		}
+		normalized.format      = format_compatible ? normalized.format : image.format;
+		normalized.base_level  = 0;
+		normalized.level_count = 1;
+		normalized.base_layer  = 0;
+		normalized.layer_count = 1;
+		normalized.type        = image.image_type == vk::ImageType::e3D   ? vk::ImageViewType::e3D
+		                         : image.image_type == vk::ImageType::e1D ? vk::ImageViewType::e1D
+		                                                                  : vk::ImageViewType::e2D;
+		if (!mapping_valid) {
+			normalized.mapping = {};
+		}
+		if (!IsValidAspect(image, normalized.aspect)) {
+			normalized.aspect = (image_aspect & vk::ImageAspectFlagBits::eDepth)
+			                        ? vk::ImageAspectFlagBits::eDepth
+			                        : vk::ImageAspectFlagBits::eColor;
+		}
 	}
 
 	for (const auto& cached: views) {

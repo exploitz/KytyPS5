@@ -195,6 +195,18 @@ if(KYTY_CLANG_CL)
 	if(KYTY_NATIVE_OPT)
 		add_compile_options("$<$<CONFIG:Release>:/clang:-O3>" "$<$<CONFIG:Release>:/clang:-march=${KYTY_MARCH}>")
 	endif()
+	# A build for others (tools\release\build-release.cmd): no path of the building PC in the programs (the sources'
+	# __FILE__ in assert messages, relative to the repository; the PDB by its name). clang matches the prefix with either
+	# separator and in any case. Only the macro's: the PGO profile names a file's local functions by the file's path.
+	# More prefixes (e.g. FetchContent sources outside the repository): KYTY_RELEASE_PATH_MAPS.
+	option(KYTY_RELEASE_PATHS "Release: no path of the building PC in the programs" OFF)
+	set(KYTY_RELEASE_PATH_MAPS "" CACHE STRING "Release paths: more directories to remap (;-separated)")
+	if(KYTY_RELEASE_PATHS)
+		foreach(kyty_prefix "${CMAKE_SOURCE_DIR}" ${KYTY_RELEASE_PATH_MAPS})
+			add_compile_options("/clang:-fmacro-prefix-map=${kyty_prefix}/=")
+		endforeach()
+		add_link_options("/PDBALTPATH:%_PDB%")
+	endif()
 	if(KYTY_THIN_LTO)
 		add_compile_options("$<$<CONFIG:Release>:-flto=thin>")
 		add_link_options("$<$<CONFIG:Release>:/opt:lldltojobs=all>")
@@ -214,6 +226,11 @@ if(KYTY_CLANG_CL)
 		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
 	endif()
 endif()
+
+# The host allocator behind operator new/delete (the render thread allocates per draw and dispatch). Chen's
+# Linux play setup preloads libmimalloc.so; on Windows it is linked in (10-06 A/B, PGO builds, still view:
+# 1-1 +2.2%, 1-2 +2.5%, Latria +1.4%; moving: 1-1 +4.7%, the Nexus -2.0%, within its noise).
+option(KYTY_MIMALLOC "operator new/delete from mimalloc (fetched, v2.5.2)" ON)
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
@@ -358,6 +375,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
 
+# KYTY_FSR4: FSR 4's colour into the TAA output, times the game's exposure (src/local/fsr4-upscale.cpp).
+set(fsr4_exposure_source "${KYTY_SOURCE_DIR}/local/fsr4-exposure.comp")
+set(fsr4_exposure_spv "${gpu_tiler_generated_dir}/fsr4_exposure.spv")
+set(fsr4_exposure_header "${gpu_tiler_generated_dir}/fsr4_exposure_spv.h")
+add_custom_command(
+	OUTPUT "${fsr4_exposure_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${fsr4_exposure_spv}" "${fsr4_exposure_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${fsr4_exposure_spv} -DOUTPUT=${fsr4_exposure_header}
+	        -DSYMBOL=FSR4_EXPOSURE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fsr4_exposure_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${fsr4_exposure_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
@@ -390,6 +423,12 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr-frame-gen.h"
+	"${KYTY_SOURCE_DIR}/local/fsr-frame-gen.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr4-upscale.h"
+	"${KYTY_SOURCE_DIR}/local/fsr4-upscale.cpp"
+	"${KYTY_SOURCE_DIR}/local/dlss-upscale.h"
+	"${KYTY_SOURCE_DIR}/local/dlss-upscale.cpp"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.h"
@@ -403,7 +442,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak libzstd_static)
+set(kyty_emulator_link_libraries common Vulkan::Headers fsr4_v07 spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak libzstd_static)
 
 # Linux system libraries required by the static FFmpeg archive.
 if(LINUX)
@@ -494,6 +533,9 @@ target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/local/static-s
 target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/local/shader-hints.h"
 	"${KYTY_SOURCE_DIR}/local/shader-hints.cpp")
 target_link_libraries(kyty_shader_precompile libzstd_static)
+if(WIN32)
+	target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/kyty-utf8.manifest")
+endif()
 if (WIN32)
 	target_link_libraries(kyty_shader_precompile opengl32 setupapi ws2_32)
 endif()
@@ -529,6 +571,10 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+
+add_executable(game_patch_locate_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GamePatchLocateTests.cpp")
+target_include_directories(game_patch_locate_tests PRIVATE ${inc_headers})
 
 add_executable(archive_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
@@ -684,6 +730,10 @@ if(BUILD_TESTING)
 	add_executable(atrac9_initialization_tests EXCLUDE_FROM_ALL tests/Atrac9InitializationTests.cpp)
 	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
 	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
+	# The game's .at9 files as arguments: `atrac9_overread_tests padded <file>...` (raw: libatrac9 in place).
+	add_executable(atrac9_overread_tests EXCLUDE_FROM_ALL tests/Atrac9OverreadTests.cpp)
+	target_link_libraries(atrac9_overread_tests PRIVATE LibAtrac9)
+	target_include_directories(atrac9_overread_tests PRIVATE "${KYTY_SOURCE_DIR}")
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -799,6 +849,10 @@ endif()
 
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+if(WIN32)
+	# UTF-8 as the process's code page: paths with any characters on the command line and in narrow file functions.
+	target_sources(kyty_emulator PRIVATE "${KYTY_SOURCE_DIR}/kyty-utf8.manifest")
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 if(LINUX)
@@ -822,6 +876,11 @@ if(LINUX)
 endif()
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
+if(KYTY_MIMALLOC)
+	# main.cpp replaces operator new/delete with mimalloc for this executable only.
+	target_link_libraries(kyty_emulator mimalloc-static)
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS KYTY_MIMALLOC=1)
+endif()
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)
@@ -848,6 +907,22 @@ if (WIN32)
 		             INCLUDE_DIRECTORIES "${KYTY_STREAMLINE_SDK}/include")
 		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/frame-gen.cpp" APPEND PROPERTY
 		             COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
+	endif()
+	# KYTY_DLSS (src/local/dlss-upscale.cpp): the NVIDIA DLSS SDK's headers and static NGX library when they were put
+	# under _Build/deps/dlss (never part of the repository); nvngx_dlss.dll is loaded at run time from deps\dlss.
+	set(KYTY_DLSS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/dlss" CACHE PATH "NVIDIA DLSS SDK for KYTY_DLSS (local only)")
+	if (EXISTS "${KYTY_DLSS_SDK}/include/nvsdk_ngx_vk.h" AND EXISTS "${KYTY_DLSS_SDK}/lib/nvsdk_ngx_d.lib")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/dlss-upscale.cpp" APPEND PROPERTY
+		             INCLUDE_DIRECTORIES "${KYTY_DLSS_SDK}/include")
+		set_property(SOURCE "${KYTY_SOURCE_DIR}/local/dlss-upscale.cpp" APPEND PROPERTY
+		             COMPILE_DEFINITIONS KYTY_DLSS_SDK=1)
+		# (Every target built from the emulator's sources compiles it: the precompiler and the full-emulator tests too.)
+		foreach(dlss_target kyty_emulator shader_cfg_tests xpr_replay_tests kyty_shader_precompile kernel_file_system_tests
+				fiber_migration_tests shader_recompiler_compute_tests virtual_memory_allocation_tests)
+			if (TARGET ${dlss_target})
+				target_link_libraries(${dlss_target} "${KYTY_DLSS_SDK}/lib/nvsdk_ngx_d.lib")
+			endif()
+		endforeach()
 	endif()
 endif()
 
@@ -900,7 +975,7 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 			"${recording_generated}"
 		DEPENDS "${recording_generator}" "${vulkan_registry}" "${vulkan_hpp}"
 		VERBATIM)
-	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests xpr_replay_tests
+	foreach(recording_target kyty_emulator kyty_shader_precompile shader_recompiler_compute_tests shader_cfg_tests xpr_replay_tests
 			virtual_memory_allocation_tests)
 		target_sources(${recording_target} PRIVATE
 			"${KYTY_SOURCE_DIR}/local/vulkan-recording.cpp" "${recording_generated}")
@@ -953,6 +1028,11 @@ endif()
 
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+endif()
+# This fork's player launcher (a standalone Qt 6 project; tools/release/build-launcher.cmd builds and deploys it alone).
+option(KYTY_BUILD_FORK_LAUNCHER "Build the fork's Qt launcher (src/fork-launcher)" OFF)
+if(KYTY_BUILD_FORK_LAUNCHER)
+	add_subdirectory("${KYTY_SOURCE_DIR}/fork-launcher" "${CMAKE_CURRENT_BINARY_DIR}/fork-launcher")
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)

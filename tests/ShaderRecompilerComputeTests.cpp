@@ -430,7 +430,8 @@ struct RenderExecutorTestAccess {
   static bool TryConsumeComputeMetaClear(RenderExecutor &executor,
                                          const ShaderComputeInputInfo &input,
                                          const CommandBuffer &buffer) {
-    return executor.TryConsumeComputeMetaClear(input, buffer, 0, 0, 0, 0);
+    uint64_t cleared = 0;
+    return executor.TryConsumeComputeMetaClear(input, buffer, 0, 0, 0, 0, cleared);
   }
 
   static TextureBinding
@@ -1239,6 +1240,8 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
+  // CompileOptions::exec_demand (KYTY_EXEC_DEMAND) for this compile; unset keeps the default.
+  std::optional<bool> exec_demand;
 };
 
 struct GraphicsCase {
@@ -1453,6 +1456,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
   options.scratch_dwords = test.compute_info.scratch_size_dwords;
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
+  }
+  if (test.exec_demand) {
+    options.exec_demand = *test.exec_demand;
   }
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
@@ -25119,6 +25125,330 @@ TestCase Wave64AppendConsumeHighHalf() {
   return test;
 }
 
+// IR::EliminateMaskedSelects (KYTY_EXEC_DEMAND) cases: one wave64 workgroup, v0 the lane. Each
+// runs with the pass off and on (RunExecDemandCase) and must read back the same words, including
+// the values lanes outside EXEC keep.
+void SetExecDemandWave64(TestCase *test) {
+  test->compute_info.threads_num[0] = 64;
+  test->compute_info.threads_num[1] = 1;
+  test->compute_info.threads_num[2] = 1;
+  test->compute_info.thread_ids_num = 1;
+  test->compute_info.wave_size = 64;
+  test->has_compute_info = true;
+}
+
+// Points the SOPP branch at code[branch] to code[target], forwards or back.
+void PatchBranch(std::vector<u32> *code, size_t branch, u32 opcode, size_t target) {
+  (*code)[branch] = EncodeSopp(opcode, static_cast<u32>(target - branch - 1u));
+}
+
+// An if/else region: each arm overwrites the temporary v3; v1 lives past the region and keeps
+// the other arm's lanes.
+TestCase ExecDemandIfElseRegion() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ExecDemandIfElseRegion";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));      // v1 = lane + 100
+  code.push_back(EncodeVop2(0x1b, 2, InlineU32(1), 0)); // v2 = lane & 1
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 2));    // vcc = even lanes
+  code.push_back(EncodeSop1(0x24, 4, 106));             // s_and_saveexec_b64 s[4:5], vcc
+  const auto skip_then = code.size();
+  code.push_back(0);
+  code.push_back(EncodeVop2(0x0b, 3, InlineU32(3), 0)); // v3 = 3 * lane
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(3), 1));      // v1 += v3
+  code.push_back(EncodeVop1(0x01, 3, InlineU32(5)));    // v3 = 5
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(3), 1));      // v1 += v3
+  const auto else_begin = code.size();
+  code.push_back(EncodeSop2(0x15, 126, 4, 126));        // exec = s[4:5] & ~exec: odd lanes
+  const auto skip_else = code.size();
+  code.push_back(0);
+  code.push_back(EncodeVop1(0x01, 3, InlineU32(11)));   // v3 = 11
+  code.push_back(EncodeVop2(0x26, 1, Vgpr(1), 3));      // v1 -= v3
+  const auto restore = code.size();
+  code.push_back(EncodeSop1(0x04, 126, 4));             // exec = s[4:5]
+  PatchBranch(&code, skip_then, 0x08, else_begin);      // s_cbranch_execz
+  PatchBranch(&code, skip_else, 0x08, restore);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(64, 0);
+  for (u32 lane = 0; lane < 64; lane++) {
+    test.expected.push_back((lane & 1u) == 0u ? lane + 100u + 3u * lane + 5u : lane + 100u - 11u);
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_AND_B32, O::V_CMP_EQ_U32,
+                  O::S_AND_SAVEEXEC_B64, O::S_CBRANCH_EXECZ, O::V_MUL_U32_U24, O::S_ANDN2_B64,
+                  O::V_SUB_NC_U32, O::S_MOV_B64, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  SetExecDemandWave64(&test);
+  return test;
+}
+
+// A per-lane loop: lane L runs (L & 7) + 1 iterations and then leaves EXEC while the others go
+// on. v1 and v5 carry across iterations and keep each finished lane's value; v6 is a temporary.
+TestCase ExecDemandLoopLanesExitEarly() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ExecDemandLoopLanesExitEarly";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 0);                           // v1: sum
+  AppendVMovU32(&code, 5, 0);                           // v5: iterations
+  code.push_back(EncodeVop2(0x1b, 2, InlineU32(7), 0)); // v2 = lane & 7
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2)); // v2 += 1: the lane's trip count
+  code.push_back(EncodeSop1(0x04, 4, 126));             // s[4:5] = exec
+  const auto loop = code.size();
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(1), 5)); // v5 += 1
+  code.push_back(EncodeVop2(0x0b, 6, InlineU32(3), 5)); // v6 = 3 * v5
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(6), 1));      // v1 += v6
+  code.push_back(EncodeVopc(0xc1, Vgpr(5), 2));         // vcc = v5 < v2
+  code.push_back(EncodeSop2(0x0f, 126, 126, 106));      // exec &= vcc
+  const auto back = code.size();
+  code.push_back(0);
+  PatchBranch(&code, back, 0x09, loop);                 // s_cbranch_execnz
+  code.push_back(EncodeSop1(0x04, 126, 4));             // exec = s[4:5]
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 64);
+  AppendEnd(&code);
+  test.initial.assign(128, 0);
+  test.expected.resize(128);
+  for (u32 lane = 0; lane < 64; lane++) {
+    const u32 trips = (lane & 7u) + 1u;
+    test.expected[lane] = 3u * trips * (trips + 1u) / 2u;
+    test.expected[64 + lane] = trips;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_AND_B32, O::V_ADD_NC_U32, O::S_MOV_B64,
+                  O::V_MUL_U32_U24, O::V_CMP_LT_U32, O::S_AND_B64, O::S_CBRANCH_EXECNZ,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  SetExecDemandWave64(&test);
+  return test;
+}
+
+// A region in a uniform loop whose lanes alternate between iterations. It reads v7 before
+// writing it, so a lane reads what its own last active iteration wrote: the write must keep v7
+// for the lanes outside the region, although the next iteration reads it under "the same" mask.
+TestCase ExecDemandLoopAlternatingRegion() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ExecDemandLoopAlternatingRegion";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 0);                           // v1: sum
+  AppendVMovU32(&code, 7, 1000);
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(0), 7));      // v7 = lane + 1000
+  code.push_back(EncodeSMovB32(8, InlineU32(0)));       // s8: iteration
+  const auto loop = code.size();
+  code.push_back(EncodeVop2(0x25, 2, 8, 0));            // v2 = s8 + lane
+  code.push_back(EncodeVop2(0x1b, 2, InlineU32(1), 2)); // v2 &= 1
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 2));    // vcc = lane + s8 even
+  code.push_back(EncodeSop1(0x24, 4, 106));             // s_and_saveexec_b64 s[4:5], vcc
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(7), 1));      // v1 += v7
+  code.push_back(EncodeVop1(0x01, 7, 8));               // v7 = s8
+  code.push_back(EncodeSop1(0x04, 126, 4));             // exec = s[4:5]
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1))); // s8 += 1
+  code.push_back(EncodeSopc(0x0a, 8, InlineU32(4)));    // scc = s8 < 4
+  const auto back = code.size();
+  code.push_back(0);
+  PatchBranch(&code, back, 0x05, loop);                 // s_cbranch_scc1
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(64, 0);
+  for (u32 lane = 0; lane < 64; lane++) {
+    // Even lanes run iterations 0 and 2 (reading 1000 + lane, then 0), odd lanes 1 and 3
+    // (reading 1000 + lane, then 1).
+    test.expected.push_back(1000u + lane + (lane & 1u));
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::V_AND_B32,
+                  O::V_CMP_EQ_U32, O::S_AND_SAVEEXEC_B64, O::S_MOV_B64, O::S_ADD_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  SetExecDemandWave64(&test);
+  return test;
+}
+
+// Nested regions: S_AND_SAVEEXEC outside, V_CMPX inside, each restored from a saved mask. v3 is
+// a temporary of both, v1 lives through both, v4 is written by the inner region only.
+TestCase ExecDemandNestedSaveRestore() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ExecDemandNestedSaveRestore";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));      // v1 = lane + 100
+  AppendVMovU32(&code, 4, 0x55);
+  code.push_back(EncodeVop2(0x1b, 2, InlineU32(3), 0)); // v2 = lane & 3
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 2));    // vcc = v2 != 0
+  code.push_back(EncodeSop1(0x24, 4, 106));             // s_and_saveexec_b64 s[4:5], vcc
+  const auto skip_outer = code.size();
+  code.push_back(0);
+  code.push_back(EncodeVop1(0x01, 3, InlineU32(1)));    // v3 = 1
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(3), 1));      // v1 += v3
+  code.push_back(EncodeSop1(0x04, 6, 126));             // s[6:7] = exec
+  code.push_back(EncodeVopc(0xd2, InlineU32(2), 2));    // v_cmpx_eq_u32 2, v2
+  const auto skip_inner = code.size();
+  code.push_back(0);
+  code.push_back(EncodeVop1(0x01, 3, InlineU32(20)));   // v3 = 20
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(3), 1));      // v1 += v3
+  code.push_back(EncodeVop1(0x01, 4, InlineU32(7)));    // v4 = 7
+  const auto restore_inner = code.size();
+  code.push_back(EncodeSop1(0x04, 126, 6));             // exec = s[6:7]
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(1), 1)); // v1 <<= 1
+  const auto restore_outer = code.size();
+  code.push_back(EncodeSop1(0x04, 126, 4));             // exec = s[4:5]
+  PatchBranch(&code, skip_outer, 0x08, restore_outer);  // s_cbranch_execz
+  PatchBranch(&code, skip_inner, 0x08, restore_inner);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 64);
+  AppendEnd(&code);
+  test.initial.assign(128, 0);
+  test.expected.resize(128);
+  for (u32 lane = 0; lane < 64; lane++) {
+    const u32 group = lane & 3u;
+    test.expected[lane] = group == 0u   ? lane + 100u
+                          : group == 2u ? (lane + 121u) * 2u
+                                        : (lane + 101u) * 2u;
+    test.expected[64 + lane] = group == 2u ? 7u : 0x55u;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_AND_B32, O::V_CMP_NE_U32,
+                  O::S_AND_SAVEEXEC_B64, O::S_CBRANCH_EXECZ, O::S_MOV_B64,
+                  O::V_CMPX_EQ_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  SetExecDemandWave64(&test);
+  return test;
+}
+
+// A region under different masks in the two wave64 halves (0x0f0f0f0f low, 0xf0f0f0f0 high).
+TestCase ExecDemandWave64HalfMasks() {
+  using O = ShaderOpcode;
+  constexpr u32 low = 0x0f0f0f0fu;
+  constexpr u32 high = 0xf0f0f0f0u;
+  TestCase test;
+  test.name = "ExecDemandWave64HalfMasks";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));      // v1 = lane + 100
+  AppendSMovLiteral(&code, 6, low);
+  AppendSMovLiteral(&code, 7, high);
+  code.push_back(EncodeSop1(0x24, 8, 6));               // s_and_saveexec_b64 s[8:9], s[6:7]
+  code.push_back(EncodeVop1(0x01, 3, InlineU32(3)));    // v3 = 3
+  code.push_back(EncodeVop2(0x0b, 1, Vgpr(3), 1));      // v1 *= v3
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 1)); // v1 += 1
+  code.push_back(EncodeSop1(0x04, 126, 8));             // exec = s[8:9]
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(64, 0);
+  for (u32 lane = 0; lane < 64; lane++) {
+    const bool active = (((lane < 32u ? low : high) >> (lane & 31u)) & 1u) != 0u;
+    test.expected.push_back(active ? (lane + 100u) * 3u + 1u : lane + 100u);
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_AND_SAVEEXEC_B64,
+                  O::V_MUL_U32_U24, O::S_MOV_B64, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  SetExecDemandWave64(&test);
+  return test;
+}
+
+// Cross-lane reads inside a region of the even lanes. v1, v6, v7 and v8 are each written in the
+// region and read by one operation: DPP row_xmask:1 with fetch-inactive and V_READLANE of lane 1
+// read the odd lanes' kept values; DS_SWIZZLE (xor 2) and DPP row_xmask:2 without fetch-inactive
+// read even lanes only.
+TestCase ExecDemandCrossLaneReadsInRegion() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ExecDemandCrossLaneReadsInRegion";
+  auto &code = test.code;
+  constexpr u32 sources[] = {1, 6, 7, 8};
+  for (u32 i = 0; i < 4; i++) {
+    AppendVMovU32(&code, sources[i], 100u * (i + 1u));
+    code.push_back(EncodeVop2(0x25, sources[i], Vgpr(0), sources[i])); // lane + 100 * (i + 1)
+  }
+  for (const u32 reg : {3u, 4u, 5u, 9u}) {
+    AppendVMovU32(&code, reg, 0x77);
+  }
+  code.push_back(EncodeVop2(0x1b, 2, InlineU32(1), 0)); // v2 = lane & 1
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 2));    // vcc = even lanes
+  code.push_back(EncodeSop1(0x24, 10, 106));            // s_and_saveexec_b64 s[10:11], vcc
+  for (u32 i = 0; i < 4; i++) {
+    code.push_back(EncodeVop2(0x25, sources[i], InlineU32(7 + 2 * i), 0)); // lane + 7, 9, 11, 13
+  }
+  code.push_back(EncodeVop1(0x01, 3, 250));             // v_mov_b32_dpp v3, v1 row_xmask:1 fi:1
+  code.push_back(EncodeVop1Dpp(1, 0x161) | (1u << 18u));
+  AppendVop3(&code, 0x360, 12, Vgpr(6), InlineU32(1));  // v_readlane_b32 s12, v6, 1
+  code.push_back(EncodeVop1(0x01, 4, 12));              // v4 = s12
+  code.push_back(EncodeDs0(0x35, 0x081f));              // ds_swizzle_b32 v5, v7 (and 0x1f, xor 2)
+  code.push_back(EncodeDs1(5, 0, 7));
+  code.push_back(EncodeVop1(0x01, 9, 250));             // v_mov_b32_dpp v9, v8 row_xmask:2
+  code.push_back(EncodeVop1Dpp(8, 0x162));
+  code.push_back(EncodeSop1(0x04, 126, 10));            // exec = s[10:11]
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 64);
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 128);
+  AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, 192);
+  AppendEnd(&code);
+  test.initial.assign(256, 0);
+  test.expected.assign(256, 0x77);
+  for (u32 lane = 0; lane < 64; lane += 2) {
+    test.expected[lane] = (lane ^ 1u) + 100u;
+    test.expected[64 + lane] = 1u + 200u;
+    test.expected[128 + lane] = (lane ^ 2u) + 11u;
+    test.expected[192 + lane] = (lane ^ 2u) + 13u;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_AND_B32, O::V_CMP_EQ_U32,
+                  O::S_AND_SAVEEXEC_B64, O::V_READLANE_B32, O::DS_SWIZZLE_B32,
+                  O::S_MOV_B64, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  SetExecDemandWave64(&test);
+  return test;
+}
+
+// The pass removes the predication of ExecDemandIfElseRegion's temporaries: fewer selects in
+// its IR and its SPIR-V. Compiles only.
+void CheckExecDemandRemovesSelects() {
+  constexpr const char *name = "ExecDemandRemovesSelects";
+  size_t ir_selects[2] = {};
+  size_t spirv_selects[2] = {};
+  for (const bool enabled : {false, true}) {
+    auto test = ExecDemandIfElseRegion();
+    test.exec_demand = enabled;
+    const auto compiled = CompileCase(test);
+    const size_t index = enabled ? 1u : 0u;
+    for (const auto *block : compiled.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SelectU32) {
+          ir_selects[index]++;
+        }
+      }
+    }
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "SPIR-V disassembly", tools.Disassemble(compiled.spirv, &text),
+            "failed to disassemble emitted SPIR-V");
+    spirv_selects[index] = CountText(text, "= OpSelect ");
+  }
+  Require(name, "IR selects", ir_selects[1] < ir_selects[0],
+          "the pass left every SelectU32 of the region's temporaries (" +
+              std::to_string(ir_selects[0]) + " -> " + std::to_string(ir_selects[1]) + ")");
+  Require(name, "SPIR-V selects", spirv_selects[1] < spirv_selects[0],
+          "the pass left every OpSelect (" + std::to_string(spirv_selects[0]) + " -> " +
+              std::to_string(spirv_selects[1]) + ")");
+  std::printf("[compute] %-32s ok (IR selects %zu -> %zu, OpSelect %zu -> %zu)\n", name,
+              ir_selects[0], ir_selects[1], spirv_selects[0], spirv_selects[1]);
+}
+
+void RunExecDemandCase(VulkanHarness *vulkan, TestCase test) {
+  for (const bool enabled : {false, true}) {
+    test.exec_demand = enabled;
+    RunCase(vulkan, test);
+  }
+}
+
+void RunExecDemandCases(VulkanHarness *vulkan) {
+  CheckExecDemandRemovesSelects();
+  RunExecDemandCase(vulkan, ExecDemandIfElseRegion());
+  RunExecDemandCase(vulkan, ExecDemandLoopLanesExitEarly());
+  RunExecDemandCase(vulkan, ExecDemandLoopAlternatingRegion());
+  RunExecDemandCase(vulkan, ExecDemandNestedSaveRestore());
+  RunExecDemandCase(vulkan, ExecDemandWave64HalfMasks());
+  RunExecDemandCase(vulkan, ExecDemandCrossLaneReadsInRegion());
+}
+
 TestCase BufferAtomicVariants() {
   using O = ShaderOpcode;
 
@@ -29085,6 +29415,15 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
            0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
+// b310b97c made the storage texture check a report (an unsupported view binds null instead of ending the
+// process); the death cases keep their contract through this wrapper.
+void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource &resource,
+                            const ShaderTextureResource &descriptor, uint64_t size) {
+  if (const auto report = StorageTextureReport(resource, descriptor, size); !report.empty()) {
+    EXIT("%s\n", report.c_str());
+  }
+}
+
 [[noreturn]] void RunStorageTextureDescriptorDeathCase(const char *kind) {
   auto resource = BasicStorageTextureResource();
   auto descriptor = BasicStorageTextureDescriptor();
@@ -32067,6 +32406,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, SharedReturnKeepsSelectedValues());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--exec-demand-only") == 0) {
+    VulkanHarness vulkan;
+    RunExecDemandCases(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());
@@ -32551,6 +32895,7 @@ int main(int argc, char **argv) {
 #endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
+  RunExecDemandCases(&vulkan);
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);

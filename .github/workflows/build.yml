@@ -1,11 +1,9 @@
 name: Build KytyPS5 (Windows)
 
-# This fork's Windows build (Demon's Souls, see README.md): a manual run (Actions > Build KytyPS5 (Windows) >
-# Run workflow) or a pushed v* tag builds the release package and publishes it as a GitHub release, marked
-# latest (README.md links to the latest one). Pushes build nothing.
+# A Windows build of the emulator by hand (Actions > Build KytyPS5 (Windows) > Run workflow), as chen's branch has it.
+# This fork's releases are made with tools/release (build-release.cmd, build-launcher.cmd, package-release.ps1:
+# the Qt launcher and the FSR files are not in this workflow), so a pushed tag starts nothing here.
 on:
-  push:
-    tags: [ 'v*' ]
   workflow_dispatch:
 
 concurrency:

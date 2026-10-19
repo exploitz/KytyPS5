@@ -5,12 +5,14 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
 
 #include <array>
+#include <atomic>
 
 #include <chrono>
 #include <cstdio>
@@ -25,6 +27,14 @@
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibAmpr {
+void InitAmpr_1(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNet {
+void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -231,6 +241,164 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
+void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
+  Libs::LibAmpr::InitAmpr_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "AMPR command and submission exports resolve");
+    return symbol->vaddr;
+  };
+  using Unary = void (KYTY_SYSV_ABI *)(void *);
+  using AprConstructor = void (KYTY_SYSV_ABI *)(void *, void *, void *);
+  using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
+  using Offset = uint64_t (KYTY_SYSV_ABI *)(void *);
+  using WaitAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t,
+                                          uint8_t, uint8_t);
+  using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
+  using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
+                                       void *, uint64_t, uint64_t);
+  using WriteKernelEvent = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint64_t,
+                                               uint64_t, uint64_t);
+  struct Result { int32_t result; uint32_t error_offset; };
+  using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
+  using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
+  using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
+  const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
+  const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
+  const auto construct_amm = reinterpret_cast<Unary>(find("EDq5bqCqYpA"));
+  const auto destroy = reinterpret_cast<Unary>(find("GuchCTefuZw"));
+  const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
+  const auto offset = reinterpret_cast<Offset>(find("GnxKOHEawhk"));
+  const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
+  const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
+  const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
+  const auto write_event = reinterpret_cast<WriteKernelEvent>(find("H896Pt-yB4I"));
+  const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
+  const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
+  const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
+  const auto wait_amm = reinterpret_cast<WaitSubmission>(find("HXymib4T8gc"));
+  struct Buffer {
+    std::array<uint64_t, 5> header {};
+    std::array<uint32_t, 256> data {};
+  };
+  std::array<Buffer, 4> buffers;
+  const auto reset = [&](size_t apr_count) {
+    for (size_t i = 0; i < buffers.size(); ++i) {
+      auto &buffer = buffers[i];
+      construct(buffer.header.data());
+      if (i < apr_count) {
+        construct_apr(buffer.header.data(), &buffer.header[3], &buffer.header[4]);
+      } else {
+        construct_amm(buffer.header.data());
+      }
+      Check(set_buffer(buffer.header.data(), buffer.data.data(), sizeof(buffer.data)) == OK,
+            "initialize AMPR command buffer");
+    }
+  };
+  // SDK WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
+  struct Comparison { uint8_t compare; uint64_t blocked, reference, released; };
+  constexpr std::array comparisons {
+      Comparison{0, 1, 2, 2}, Comparison{1, 0x40000000000019c3, 0x40000000000019c3,
+                                   0x40000000000019c4},
+      Comparison{1, 0, INT64_MAX, uint64_t{1} << 63},
+      Comparison{2, UINT64_MAX, uint64_t{1} << 63, INT64_MAX}, Comparison{3, 2, 2, 3},
+      Comparison{4, UINT64_MAX - 1, UINT64_MAX, 0},
+      Comparison{5, UINT64_MAX, 0, 1}, Comparison{6, 0, 0, UINT64_MAX}};
+  for (const auto &comparison : comparisons) {
+    reset(3);
+    uint64_t fence = comparison.blocked;
+    uint64_t blocked_done = 0, read_done = 0, lower_done = 0;
+    std::array<char, 3> output {};
+    std::array<Result, 3> results {{{1234, 5678}, {1234, 5678}, {1234, 5678}}};
+    std::array<uint32_t, 4> ids {};
+    auto *blocked = buffers[0].header.data();
+    auto *reader = buffers[1].header.data();
+    auto *lower = buffers[2].header.data();
+    auto *producer = buffers[3].header.data();
+    Check(wait_address(blocked, &fence, comparison.reference, comparison.compare, 0) == OK &&
+              write_address(blocked, &blocked_done, 1) == OK &&
+              read_file(reader, reinterpret_cast<uint64_t>(&buffers[1].header[3]),
+                        reinterpret_cast<uint64_t>(&buffers[1].header[4]), file_id,
+                        output.data(), output.size(), 0) == OK &&
+              write_address(reader, &read_done, 2) == OK &&
+              write_address(lower, &lower_done, 3) == OK &&
+              write_address(producer, &fence, comparison.released) == OK,
+          "build dependent APR read and later AMM fence producer");
+    Check(submit_apr(blocked, 3, &results[0], &ids[0]) == OK &&
+              submit_apr(reader, 3, &results[1], &ids[1]) == OK &&
+              submit_apr(lower, 4, &results[2], &ids[2]) == OK && wait_apr(ids[2]) == OK,
+          "APR submit returns while blocked and a lower priority completes");
+    Check(lower_done == 3 && blocked_done == 0 && read_done == 0 &&
+              output == std::array<char, 3>{} && results[0].result == 1234 &&
+              results[1].result == 1234,
+          "unsatisfied wait blocks later buffers at its priority without publishing completion");
+    Check(submit_amm(buffers[3].data.data(), static_cast<uint32_t>(offset(producer)), 1,
+                     &ids[3]) == OK && wait_amm(ids[3]) == OK &&
+              wait_apr(ids[0]) == OK && wait_apr(ids[1]) == OK,
+          "later AMM submission releases the APR dependency");
+    Check(blocked_done == 1 && read_done == 2 && std::memcmp(output.data(), "APR", 3) == 0,
+          "APR reads real file bytes only after its dependency completes");
+    for (const auto &result : results) {
+      Check(result.result == OK,
+            "submission wait observes the completed result");
+    }
+  }
+  reset(1);
+  namespace EventQueue = Libs::LibKernel::EventQueue;
+  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+  uint64_t ampr_user_data = 1, user_data = 2;
+  Check(EventQueue::KernelCreateEqueue(&queue, "apr-completion") == OK &&
+            EventQueue::KernelAddAmprEvent(queue, 42, &ampr_user_data) == OK &&
+            EventQueue::KernelAddUserEventEdge(queue, 42) == OK,
+        "AMPR and user events can share an identifier");
+  std::array<char, 3> output {};
+  Result event_result {1234, 5678};
+  uint32_t event_submission = 0;
+  auto *reader = buffers[0].header.data();
+  Check(read_file(reader, reinterpret_cast<uint64_t>(&buffers[0].header[3]),
+                  reinterpret_cast<uint64_t>(&buffers[0].header[4]), file_id,
+                  output.data(), output.size(), 0) == OK &&
+            write_event(reader, queue, 42, 0x123456789abc, 0, 0) == OK &&
+            submit_apr(reader, 3, &event_result, &event_submission) == OK &&
+            wait_apr(event_submission) == OK && event_result.result == OK,
+        "APR read submits its completion event");
+  std::array<EventQueue::KernelEvent, 2> events {};
+  int event_count = 0;
+  const Libs::LibKernel::KernelUseconds poll = 0;
+  Check(EventQueue::KernelWaitEqueue(queue, events.data(), 2, &event_count, &poll) == OK &&
+            event_count == 1 && events[0].ident == 42 && events[0].filter == -25 &&
+            events[0].data == 0x123456789abc && events[0].udata == &ampr_user_data &&
+            std::memcmp(output.data(), "APR", 3) == 0,
+        "APR completion reports the AMPR filter, payload and registration user data");
+  Check(EventQueue::KernelDeleteAmprEvent(queue, 42) == OK &&
+            EventQueue::KernelTriggerEvent(queue, 42, -25, nullptr) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            EventQueue::KernelTriggerUserEvent(queue, 42, &user_data) == OK &&
+            EventQueue::KernelWaitEqueue(queue, events.data(), 2, &event_count, &poll) == OK &&
+            event_count == 1 && events[0].filter == EventQueue::KERNEL_EVFILT_USER &&
+            events[0].udata == &user_data,
+        "deleting AMPR leaves the user event with the same identifier intact");
+  Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete APR completion queue");
+  reset(0);
+  uint64_t cpu_fence = 0, amm_done = 0, lower_done = 0;
+  std::array<uint32_t, 2> ids {};
+  Check(wait_address(buffers[0].header.data(), &cpu_fence, 0, 1, 0) == OK &&
+            write_address(buffers[0].header.data(), &amm_done, 1) == OK &&
+            write_address(buffers[1].header.data(), &lower_done, 1) == OK &&
+            submit_amm(buffers[0].data.data(), static_cast<uint32_t>(offset(buffers[0].header.data())),
+                       0, &ids[0]) == OK &&
+            submit_amm(buffers[1].data.data(), static_cast<uint32_t>(offset(buffers[1].header.data())),
+                       1, &ids[1]) == OK && wait_amm(ids[1]) == OK,
+        "AMM lower priority progresses while its high priority waits");
+  Check(lower_done == 1 && amm_done == 0, "AMM wait preserves its dependency");
+  std::atomic_ref(cpu_fence).store(1, std::memory_order_release);
+  Check(wait_amm(ids[0]) == OK && amm_done == 1,
+        "AMM observes an external CPU fence store without a submission notification");
+  for (auto &buffer : buffers) {
+    destroy(buffer.header.data());
+  }
+}
+
 void CheckAprPaths(const std::filesystem::path &root) {
   Loader::SymbolDatabase symbols;
   Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
@@ -297,6 +465,7 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
+  CheckAmprOrdering(symbols, expected_id);
   FileSystem::Umount("/app0");
 }
 

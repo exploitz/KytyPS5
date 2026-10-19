@@ -28,6 +28,23 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(xbyak zydis)
 
+# KYTY_MIMALLOC: the emulator's operator new/delete (src/main.cpp) from mimalloc instead of the CRT heap.
+if(KYTY_MIMALLOC)
+	set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+	set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+	set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+	set(MI_OVERRIDE OFF CACHE BOOL "" FORCE)
+	FetchContent_Declare(
+		mimalloc
+		GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+		GIT_TAG 2406cc5f3ab6d6e54fe560cdd66fa46eee775312 # v2.5.2
+		GIT_SHALLOW FALSE
+	)
+	FetchContent_MakeAvailable(mimalloc)
+	# SPIRV-Tools would add mimalloc a second time.
+	set(SPIRV_TOOLS_USE_MIMALLOC OFF CACHE BOOL "" FORCE)
+endif()
+
 # ZArchive (.zar): random-access reads of compressed game dumps (upstream's pinned revisions and reader patch). The
 # library and its zstd dependency; zarchive_tool (not built by default) packs a game folder into a .zar.
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
@@ -88,6 +105,22 @@ add_library(Vulkan::Headers ALIAS Vulkan-Headers)
 target_include_directories(Vulkan-Headers INTERFACE
 	"${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include"
 )
+
+# FSR 4's source-v07 INT8 model on Vulkan (FireBurn/FSR-Vulkan, MIT; fsr4-v07/VERSION.txt): KYTY_FSR4
+# (src/local/fsr4-upscale.cpp). Its Vulkan calls go through the emulator's dispatcher (kyty-fsr4-vk.h).
+add_library(fsr4_v07 STATIC
+	fsr4-v07/src/ffx_vk_fsr4_v07.c
+	fsr4-v07/src/ffx_vk_fsr4_v07_provider.c
+	fsr4-v07/src/ffx_vk_fsr4_v07_assets.c
+	fsr4-v07/src/ffx_vk_fsr4_v07_schedule.c
+)
+target_include_directories(fsr4_v07 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/fsr4-v07/include")
+target_link_libraries(fsr4_v07 PUBLIC Vulkan::Headers)
+if(MSVC)
+	target_compile_options(fsr4_v07 PRIVATE /W0 /WX-)
+else()
+	target_compile_options(fsr4_v07 PRIVATE -w)
+endif()
 
 add_library(imgui STATIC
 	imgui/imgui.cpp

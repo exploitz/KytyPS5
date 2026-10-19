@@ -1,0 +1,108 @@
+// KytyPS5: the FSR4 v07 backend calls Vulkan through a table of the emulator's dispatcher functions
+// (src/local/fsr4-upscale.cpp fills it): the emulator loads Vulkan itself (VK_NO_PROTOTYPES, no loader library),
+// and its commands may go through its recording layer, which calls straight to the driver would bypass.
+// Included by ffx_vk_vulkan_compat.h in place of <vulkan/vulkan.h>. KYTY_FSR4_VK_NO_MACROS: the table only.
+#pragma once
+
+#ifndef VK_NO_PROTOTYPES
+#define VK_NO_PROTOTYPES
+#endif
+#include <vulkan/vulkan.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct KytyFsr4VkFunctions {
+	PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets;
+	PFN_vkAllocateMemory vkAllocateMemory;
+	PFN_vkBindBufferMemory vkBindBufferMemory;
+	PFN_vkBindImageMemory vkBindImageMemory;
+	PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets;
+	PFN_vkCmdBindPipeline vkCmdBindPipeline;
+	PFN_vkCmdClearColorImage vkCmdClearColorImage;
+	PFN_vkCmdCopyBuffer vkCmdCopyBuffer;
+	PFN_vkCmdDispatch vkCmdDispatch;
+	PFN_vkCmdFillBuffer vkCmdFillBuffer;
+	PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier;
+	PFN_vkCreateBuffer vkCreateBuffer;
+	PFN_vkCreateComputePipelines vkCreateComputePipelines;
+	PFN_vkCreateDescriptorPool vkCreateDescriptorPool;
+	PFN_vkCreateDescriptorSetLayout vkCreateDescriptorSetLayout;
+	PFN_vkCreateImage vkCreateImage;
+	PFN_vkCreateImageView vkCreateImageView;
+	PFN_vkCreatePipelineLayout vkCreatePipelineLayout;
+	PFN_vkCreateSampler vkCreateSampler;
+	PFN_vkCreateShaderModule vkCreateShaderModule;
+	PFN_vkDestroyBuffer vkDestroyBuffer;
+	PFN_vkDestroyDescriptorPool vkDestroyDescriptorPool;
+	PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout;
+	PFN_vkDestroyImage vkDestroyImage;
+	PFN_vkDestroyImageView vkDestroyImageView;
+	PFN_vkDestroyPipeline vkDestroyPipeline;
+	PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout;
+	PFN_vkDestroySampler vkDestroySampler;
+	PFN_vkDestroyShaderModule vkDestroyShaderModule;
+	PFN_vkDeviceWaitIdle vkDeviceWaitIdle;
+	PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties;
+	PFN_vkFreeMemory vkFreeMemory;
+	PFN_vkGetBufferMemoryRequirements vkGetBufferMemoryRequirements;
+	PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements;
+	PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
+	PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
+	PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
+	PFN_vkMapMemory vkMapMemory;
+	PFN_vkResetDescriptorPool vkResetDescriptorPool;
+	PFN_vkUnmapMemory vkUnmapMemory;
+	PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets;
+} KytyFsr4VkFunctions;
+
+extern KytyFsr4VkFunctions kyty_fsr4_vk;
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifndef KYTY_FSR4_VK_NO_MACROS
+#define vkAllocateDescriptorSets kyty_fsr4_vk.vkAllocateDescriptorSets
+#define vkAllocateMemory kyty_fsr4_vk.vkAllocateMemory
+#define vkBindBufferMemory kyty_fsr4_vk.vkBindBufferMemory
+#define vkBindImageMemory kyty_fsr4_vk.vkBindImageMemory
+#define vkCmdBindDescriptorSets kyty_fsr4_vk.vkCmdBindDescriptorSets
+#define vkCmdBindPipeline kyty_fsr4_vk.vkCmdBindPipeline
+#define vkCmdClearColorImage kyty_fsr4_vk.vkCmdClearColorImage
+#define vkCmdCopyBuffer kyty_fsr4_vk.vkCmdCopyBuffer
+#define vkCmdDispatch kyty_fsr4_vk.vkCmdDispatch
+#define vkCmdFillBuffer kyty_fsr4_vk.vkCmdFillBuffer
+#define vkCmdPipelineBarrier kyty_fsr4_vk.vkCmdPipelineBarrier
+#define vkCreateBuffer kyty_fsr4_vk.vkCreateBuffer
+#define vkCreateComputePipelines kyty_fsr4_vk.vkCreateComputePipelines
+#define vkCreateDescriptorPool kyty_fsr4_vk.vkCreateDescriptorPool
+#define vkCreateDescriptorSetLayout kyty_fsr4_vk.vkCreateDescriptorSetLayout
+#define vkCreateImage kyty_fsr4_vk.vkCreateImage
+#define vkCreateImageView kyty_fsr4_vk.vkCreateImageView
+#define vkCreatePipelineLayout kyty_fsr4_vk.vkCreatePipelineLayout
+#define vkCreateSampler kyty_fsr4_vk.vkCreateSampler
+#define vkCreateShaderModule kyty_fsr4_vk.vkCreateShaderModule
+#define vkDestroyBuffer kyty_fsr4_vk.vkDestroyBuffer
+#define vkDestroyDescriptorPool kyty_fsr4_vk.vkDestroyDescriptorPool
+#define vkDestroyDescriptorSetLayout kyty_fsr4_vk.vkDestroyDescriptorSetLayout
+#define vkDestroyImage kyty_fsr4_vk.vkDestroyImage
+#define vkDestroyImageView kyty_fsr4_vk.vkDestroyImageView
+#define vkDestroyPipeline kyty_fsr4_vk.vkDestroyPipeline
+#define vkDestroyPipelineLayout kyty_fsr4_vk.vkDestroyPipelineLayout
+#define vkDestroySampler kyty_fsr4_vk.vkDestroySampler
+#define vkDestroyShaderModule kyty_fsr4_vk.vkDestroyShaderModule
+#define vkDeviceWaitIdle kyty_fsr4_vk.vkDeviceWaitIdle
+#define vkEnumerateDeviceExtensionProperties kyty_fsr4_vk.vkEnumerateDeviceExtensionProperties
+#define vkFreeMemory kyty_fsr4_vk.vkFreeMemory
+#define vkGetBufferMemoryRequirements kyty_fsr4_vk.vkGetBufferMemoryRequirements
+#define vkGetImageMemoryRequirements kyty_fsr4_vk.vkGetImageMemoryRequirements
+#define vkGetPhysicalDeviceFeatures2 kyty_fsr4_vk.vkGetPhysicalDeviceFeatures2
+#define vkGetPhysicalDeviceFormatProperties kyty_fsr4_vk.vkGetPhysicalDeviceFormatProperties
+#define vkGetPhysicalDeviceMemoryProperties kyty_fsr4_vk.vkGetPhysicalDeviceMemoryProperties
+#define vkMapMemory kyty_fsr4_vk.vkMapMemory
+#define vkResetDescriptorPool kyty_fsr4_vk.vkResetDescriptorPool
+#define vkUnmapMemory kyty_fsr4_vk.vkUnmapMemory
+#define vkUpdateDescriptorSets kyty_fsr4_vk.vkUpdateDescriptorSets
+#endif

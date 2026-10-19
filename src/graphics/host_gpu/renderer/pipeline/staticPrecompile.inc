@@ -36,9 +36,8 @@ SeedSpecializations(const ShaderRecompiler::IR::Program& program) {
 	}
 	// Compute shaders that declare 3D images (outside tables) are often given 2D textures there (most
 	// specializations of recorded play the seeds missed), nearly always the last ones of them (95%:
-	// 3D 2D, 2D 2D, 3D 3D 2D...): every variant again with the last 1, 2, ... of them 2D; with three of
-	// them also the two that keep the last one a volume (2D 2D 3D, 3D 2D 3D: 72 of the 73 other 3D
-	// misses of the 10-01 tour). All subsets would be 2^k - 1 variants each instead of k (+ 2).
+	// 3D 2D, 2D 2D, 3D 3D 2D...): every variant again with the last 1, 2, ... of them 2D (all subsets
+	// would be 2^k - 1 variants each instead of k).
 	const auto with_volumes_as_2d = [&](std::vector<ShaderRecompiler::IR::ResourceSpecialization> out) {
 		std::vector<uint32_t> volumes;
 		for (uint32_t index = 0; index < program.info.images.size(); index++) {
@@ -46,14 +45,11 @@ SeedSpecializations(const ShaderRecompiler::IR::Program& program) {
 				volumes.push_back(index);
 		}
 		if (program.stage != ShaderType::Compute || volumes.empty()) return out;
-		std::vector<std::vector<uint32_t>> flat_sets; // the volumes given 2D textures, per variant
-		for (size_t last = 1; last <= volumes.size(); last++) flat_sets.emplace_back(volumes.end() - last, volumes.end());
-		if (volumes.size() == 3) flat_sets.insert(flat_sets.end(), {{volumes[0], volumes[1]}, {volumes[1]}});
 		for (size_t variant = 0, count = out.size(); variant < count; variant++) {
-			for (const auto& flat_set: flat_sets) {
-				auto flat = out[variant];
-				for (const auto volume: flat_set) flat.images[volume].dimension = ImageDimension::Dim2D;
-				out.push_back(std::move(flat));
+			auto flat = out[variant];
+			for (auto volume = volumes.rbegin(); volume != volumes.rend(); ++volume) {
+				flat.images[*volume].dimension = ImageDimension::Dim2D;
+				out.push_back(flat);
 			}
 		}
 		return out;
@@ -325,6 +321,9 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				(void)ShaderRecompiler::IR::PortableFormats(translated.program.info, specialization);
 				auto result =
 				    ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, push_cursor);
+				// --shader-validation: each module through spirv-val, a failure a rejection of its own.
+				if (!ValidateShaderSpirv(options.dump_label, seed.hash, result.spirv))
+					EXIT("SPIR-V validation failed hash=0x%016" PRIx64 "\n", seed.hash);
 				const Spirv     spirv {XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t)),
 				                   result.spirv.size()};
 				// KYTY_SHADER_DUMP=<dir>: the module too, as <stage>_<hash>_<SPIR-V hash>.spv.

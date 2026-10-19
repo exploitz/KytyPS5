@@ -39,6 +39,9 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 #include "frame-gen.h"
+#include "fsr-frame-gen.h"
+#include "dlss-upscale.h"
+#include "fsr4-upscale.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -101,6 +104,14 @@ static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions,
 static bool HasExtension(const std::vector<const char*>& extensions, const char* name) {
 	return std::any_of(extensions.begin(), extensions.end(),
 	                   [name](const char* ext) { return strcmp(ext, name) == 0; });
+}
+
+// With KYTY_BDA_SPARSE=1 (KYTY_BDA_SPARSE_ZERO=0 off): VK_EXT_zero_initialize_device_memory, so the sparse page
+// table's new pages read zero from the moment they are bound (GraphicContext::zero_initialize_memory).
+static bool SparseZeroWanted() {
+	const char* sparse = std::getenv("KYTY_BDA_SPARSE");
+	const char* zero   = std::getenv("KYTY_BDA_SPARSE_ZERO");
+	return sparse != nullptr && sparse[0] != '\0' && sparse[0] != '0' && !(zero != nullptr && zero[0] == '0');
 }
 
 // VK_KHR_pipeline_binary for the static precompile's pipelines (pipelineBinaries.h), with maintenance5
@@ -637,7 +648,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priorities[2] = {1.0f, 1.0f};
+	const float               queue_priorities[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.sType            = vk::StructureType::eDeviceQueueCreateInfo;
 	queue_create_info.queueFamilyIndex = queue_family;
@@ -658,6 +669,17 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		if (queue_family < family_count && families[queue_family].queueCount >= 2) {
 			queue_create_infos[0].queueCount = 2;
 			graphics.present_queue_created   = true;
+		}
+		// KYTY_FRAMEGEN_FSR: the frame-interpolation swapchain's async compute, present and
+		// image-acquire queues, after the renderer's two.
+		if (const auto extra = FsrFrameGen::ExtraQueueCount(); extra != 0 && queue_family < family_count) {
+			if (families[queue_family].queueCount >= 2 + extra) {
+				queue_create_infos[0].queueCount = 2 + extra;
+				graphics.fsr_queues_created      = true;
+			} else {
+				LOGF("\tKYTY_FRAMEGEN_FSR: family %u has %u queues, %u needed\n", queue_family,
+				     families[queue_family].queueCount, 2 + extra);
+			}
 		}
 	}
 #endif
@@ -812,6 +834,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	}
 	const auto required_features12 = WindowContext::RequiredVulkan12Features();
 	const auto required_features13 = WindowContext::RequiredVulkan13Features();
+	// KYTY_FSR4: the features its shaders need, only when it is on and the device has them all.
+	const bool fsr4 = Fsr4Upscale::DeviceSupports(physical_device, device_extensions, supported_features2.features,
+	                                              supported_features12, supported_features13);
+	if (fsr4) {
+		features12.shaderInt8    = VK_TRUE;
+		features12.shaderFloat16 = VK_TRUE;
+	}
 	EXIT_NOT_IMPLEMENTED(required_features12.samplerMirrorClampToEdge == VK_TRUE &&
 	                     supported_features12.samplerMirrorClampToEdge != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.timelineSemaphore == VK_TRUE &&
@@ -866,6 +895,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.multiDrawIndirect                    = VK_TRUE; // (indirect draws of several argument sets)
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	if (fsr4) {
+		device_features.shaderInt16                       = VK_TRUE;
+		device_features.shaderStorageImageExtendedFormats = VK_TRUE;
+	}
 	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue (the BDA page table).
 	{
 		vk::PhysicalDeviceProperties properties {};
@@ -883,6 +916,21 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			device_features.sparseBinding         = VK_TRUE;
 			device_features.sparseResidencyBuffer = VK_TRUE;
 		}
+		// KYTY_BDA_SPARSE_BIND=own: the binds on a queue of their own, as our 10-07 page table had them (an A/B).
+		const char* bind = std::getenv("KYTY_BDA_SPARSE_BIND");
+		if (graphics.sparse_residency_buffers && bind != nullptr && std::string_view(bind) == "own" &&
+		    families[queue_family].queueCount > queue_create_infos[0].queueCount && queue_create_infos[0].queueCount < 8)
+			graphics.sparse_queue_index = queue_create_infos[0].queueCount++;
+		if (graphics.sparse_residency_buffers &&
+		    HasExtension(device_extensions, VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME)) {
+			vk::PhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT zero_memory {};
+			vk::PhysicalDeviceFeatures2                             query {};
+			query.pNext = &zero_memory;
+			physical_device.getFeatures2(&query);
+			graphics.zero_initialize_memory = zero_memory.zeroInitializeDeviceMemory == VK_TRUE;
+		}
+		LOGF("Vulkan zero-initialized memory for the sparse page table: %s\n",
+		     graphics.zero_initialize_memory ? "true" : "false");
 	}
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
@@ -932,6 +980,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 	features13.pipelineCreationCacheControl = supported_features13.pipelineCreationCacheControl;
+	if (fsr4) features13.shaderIntegerDotProduct = VK_TRUE;
 	graphics.pipeline_cache_control_enabled = features13.pipelineCreationCacheControl == VK_TRUE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
@@ -992,6 +1041,18 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		memory_priority.memoryPriority = VK_TRUE;
 		memory_priority.pNext          = const_cast<void*>(create_info.pNext);
 		create_info.pNext              = &memory_priority;
+	}
+	vk::PhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT zero_memory {};
+	if (graphics.zero_initialize_memory) {
+		zero_memory.zeroInitializeDeviceMemory = VK_TRUE;
+		zero_memory.pNext                      = const_cast<void*>(create_info.pNext);
+		create_info.pNext                      = &zero_memory;
+	}
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives {};
+	if (fsr4) {
+		derivatives.computeDerivativeGroupLinear = VK_TRUE;
+		derivatives.pNext                        = const_cast<void*>(create_info.pNext);
+		create_info.pNext                        = &derivatives;
 	}
 	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
 	const bool fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
@@ -1303,6 +1364,7 @@ void WindowContext::CreateVulkan() {
 	}
 #endif
 	inst_info.pApplicationInfo        = &app_info;
+	DlssUpscale::AddInstanceExtensions(r.available_extensions, r.required_extensions); // (KYTY_DLSS)
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());
 	inst_info.ppEnabledExtensionNames = r.required_extensions.data();
 	inst_info.enabledLayerCount =
@@ -1411,6 +1473,9 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
 			graphic_ctx.memory_priority_enabled = true;
 		}
+		if (SparseZeroWanted() && HasExtension(available_extensions, VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME);
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
@@ -1438,6 +1503,8 @@ void WindowContext::CreateVulkan() {
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		Fsr4Upscale::AddDeviceExtensions(available_extensions, device_extensions);
+		DlssUpscale::AddDeviceExtensions(graphic_ctx.instance, graphic_ctx.physical_device, available_extensions, device_extensions);
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
@@ -1482,12 +1549,22 @@ void WindowContext::CreateVulkan() {
 		graphic_ctx.device.getQueue(queue_family, 1, &graphic_ctx.present_queue);
 		LOGF("\tpresent queue: family %u index 1\n", queue_family);
 	}
+	if (graphic_ctx.sparse_queue_index != 0) {
+		graphic_ctx.device.getQueue(queue_family, graphic_ctx.sparse_queue_index, &graphic_ctx.sparse_queue);
+		EXIT_IF(graphic_ctx.sparse_queue == nullptr);
+		LOGF("\tsparse bind queue: family %u index %u (KYTY_BDA_SPARSE_BIND=own)\n", queue_family, graphic_ctx.sparse_queue_index);
+	}
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
 		EXIT_IF(graphic_ctx.readback_queue == nullptr);
 		DeviceFault::NoteQueue(graphic_ctx.readback_queue, "readback");
 	}
 	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
+	Libs::Graphics::DlssUpscale::OnDevice(graphic_ctx);
+	// FSR 4 and DLSS take the frame's jitter from frame generation's camera.
+	if (Libs::Graphics::Fsr4Upscale::Active()) Libs::Graphics::FrameGen::EnableCamera();
+	if (graphic_ctx.fsr_queues_created)
+		Libs::Graphics::FsrFrameGen::OnDevice(graphic_ctx.physical_device, graphic_ctx.device, queue_family, 2);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1594,6 +1671,9 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
 			graphic_ctx.memory_priority_enabled = true;
 		}
+		if (SparseZeroWanted() && HasExtension(available_extensions, VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME);
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
@@ -1624,6 +1704,8 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1))
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+	if (graphic_ctx.sparse_queue_index != 0)
+		graphic_ctx.device.getQueue(queue_family, graphic_ctx.sparse_queue_index, &graphic_ctx.sparse_queue);
 	return graphic_ctx.queue != nullptr && graphic_ctx.CreateAllocator();
 }
 

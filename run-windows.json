@@ -40,10 +40,11 @@
     "KYTY_TEXTURE_RESOLVE_PAGES": "1",
     "KYTY_ASYNC_REPROTECT": "1",
     "KYTY_READBACK_NARROW": "1",
-    "KYTY_SHADER_WARMUP_THREADS": "16",
+    "KYTY_SHADER_WARMUP_THREADS": "auto",
     "KYTY_READBACK_QUEUE": "1",
     "KYTY_TABLE_XPR": "2",
-    "KYTY_TABLE_DISPATCH": "1"
+    "KYTY_TABLE_DISPATCH": "1",
+    "KYTY_EXEC_DEMAND": "1"
   },
   "command": [
     "--",

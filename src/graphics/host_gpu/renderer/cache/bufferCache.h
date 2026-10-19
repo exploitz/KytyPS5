@@ -92,7 +92,8 @@ public:
 	[[nodiscard]] const Buffer* GetLodStatsBuffer() const noexcept { return &m_lod_stats_buffer; }
 	void ReportLodStats(void* dst, uint32_t size, bool reset);
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	// Both the first registration and the first consumer clear the table, so unowned entries read as zero.
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	// `refillable`: set when the bytes went to the staging ring by the upload worker (RefillImageStaging may copy them
 	// again while the upload is unsubmitted).
@@ -226,6 +227,13 @@ public:
 	[[nodiscard]] bool TakeRegistrationSpans(std::vector<GuestRange>& spans);
 
 	void               RunGarbageCollector(bool collect = true);
+	// The video memory inventory: the registered buffers' bytes and count, the collector's thresholds.
+	[[nodiscard]] uint64_t AccountedBytes() const noexcept { return m_accounted_bytes; }
+	[[nodiscard]] uint64_t AccountedBuffers() const noexcept { return m_accounted_buffers; }
+	[[nodiscard]] uint64_t Registrations() const noexcept { return m_registrations; }
+	[[nodiscard]] uint64_t GcDeletions() const noexcept { return m_gc_deletions; }
+	[[nodiscard]] uint64_t TriggerGcMemory() const noexcept { return m_trigger_gc_memory; }
+	[[nodiscard]] uint64_t CriticalGcMemory() const noexcept { return m_critical_gc_memory; }
 	// The video memory the game buffers in use that got system memory need back, with headroom (0: none): the texture
 	// collector makes this room too (TextureCache::RunGarbageCollector). Updated every 60 flips.
 	[[nodiscard]] uint64_t SpilledRoom() const noexcept { return m_spilled_room; }
@@ -307,6 +315,10 @@ private:
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_lod_stats_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	bool                                              m_bda_pagetable_initialized = false;
+	// Device memory is not zero-initialized, and a zero entry is what shaders read as unmapped
+	// (upstream PR #1065): the table is filled with zeros before its first use.
+	void EnsureBdaPageTableInitialized();
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
@@ -388,6 +400,13 @@ public:
 
 private:
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_accounted_bytes    = 0; // the buffers' own sizes
+	uint64_t                                          m_accounted_buffers  = 0;
+	uint64_t                                          m_registrations      = 0; // churn: buffers registered,
+	uint64_t                                          m_gc_deletions       = 0; // and deleted by the collector
+	// Ranges the collector freed at the critical level: begin -> {end, tick} (Buffer::came_back).
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_collected;
+	[[nodiscard]] bool TakeCollected(uint64_t begin, uint64_t end);
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

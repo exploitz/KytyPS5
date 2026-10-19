@@ -1,0 +1,24 @@
+#version 450
+// KYTY_FSR4 (fsr4-upscale.cpp): FSR 4's result into the TAA pass's output as the game's TAA leaves it. The game's TAA
+// multiplies its colour by the frame's exposure (the first float of its constants, 10-09 measurement: output/input
+// 0.40-0.41 = that value) and writes per-pixel flags in alpha (small integers the later passes read): the colour here
+// is FSR 4's times that exposure, the alpha the game's TAA wrote (it ran first).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D fsr4_color;
+layout(set = 0, binding = 1, rgba16f) uniform image2D taa_output;
+layout(set = 0, binding = 2, std430) readonly buffer Constants {
+	float words[];
+} constants;
+layout(push_constant) uniform Push {
+	uint exposure_word; // the exposure's word in the binding (the guest offset's misalignment, in words)
+	uint width;
+	uint height;
+} pc;
+
+void main() {
+	const uvec2 p = gl_GlobalInvocationID.xy;
+	if (p.x >= pc.width || p.y >= pc.height) return;
+	const float exposure = constants.words[pc.exposure_word];
+	const vec4  game     = imageLoad(taa_output, ivec2(p));
+	imageStore(taa_output, ivec2(p), vec4(imageLoad(fsr4_color, ivec2(p)).rgb * exposure, game.a));
+}

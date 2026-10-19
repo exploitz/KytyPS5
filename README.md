@@ -1,459 +1,215 @@
-> [!NOTE]
-> **This fork is tuned for Demon's Souls.** Its renderer, shader and memory paths are optimized for
-> **Demon's Souls (PS5, PPSA01341), game versions 1.07 (01.007.000) and 1.05 (01.005.000)**: both are
-> supported, with the same performance patches (each version precompiles its own shader caches); other
-> versions and games are untested here and may not run. Tested on Windows 11 with an Intel i9-14900K and
-> an NVIDIA RTX 5090 (about 45–60 fps at 2560×1440); AMD and Intel GPUs are untested. 32 GB of RAM and a
-> GPU with 12 GB of video memory are recommended; it also runs with 16 GB of RAM (slower loading) and 8 GB
-> of video memory (the test PC limited to 8 GB: most areas 40–60 fps, the heaviest 10–35).
->
-> **Download: [the latest release](https://github.com/chenxiao07/KytyPS5/releases/latest)**, a Windows
-> x64 build made by GitHub Actions from this branch. Unzip it, double-click `launcher.cmd` (or
-> `run.cmd`) and choose the game folder (the one with `eboot.bin`); the `README.md` inside explains
-> the rest. Use only a game dump made from your own copy of the game. To build it yourself, see
-> [Building with build-windows.cmd](#building-with-build-windowscmd-windows).
->
-> 中文：本分支专为《恶魔之魂》(PS5 版 PPSA01341) 优化，支持游戏版本 1.07 (01.007.000) 和 1.05 (01.005.000)，两者性能补丁相同
-> （着色器缓存按版本分别预编译）；其他版本和游戏未测试。
-> 下载[最新 release](https://github.com/chenxiao07/KytyPS5/releases/latest)，解压后双击 `launcher.cmd`
-> 或 `run.cmd`，选择游戏目录（含 `eboot.bin` 的那一层）。推荐 32 GB 内存、12 GB 以上显存的显卡；16 GB 内存
-> （加载较慢）和 8 GB 显存（测试机限制到 8 GB 时：多数区域 40–60 帧，最重的场景 10–35 帧）也能运行。
-
-## Fixes worth cherry-picking
-
-Most of this fork is performance work tied to its own caches, but these three fixes stand on their
-own and are useful in other KytyPS5 trees:
-
-**1. Game audio: the game was silent, then positional sounds were nearly inaudible**
-
-- [`f203d0f3`](https://github.com/chenxiao07/KytyPS5/commit/f203d0f3), its audio part only (the commit
-  also holds Windows packaging): ATRAC9 streams in a RIFF container required the whole `data` chunk in
-  the first stream piece, so every decode returned partial input and the game played no sound besides
-  its videos; AudioOut2 object ports are mixed into the main port. Take just its two audio files:
-  `git show f203d0f3 -- src/libs/ajm/atrac9_decoder.h src/libs/libAudio2.cpp | git apply`
-  (upstream has rewritten its RIFF parsing since, in `e40438f9`: compare before taking that part).
-- [`c2b48aeb`](https://github.com/chenxiao07/KytyPS5/commit/c2b48aeb), `git cherry-pick c2b48aeb` after
-  the above: the game sends its whole mix as two fifth-order ambisonics scenes on AudioOut2 object
-  ports (attribute 8 = 0x40 | ACN, SN3D). Summed into the front pair they cancelled out; they are now
-  decoded to stereo from the first order, and 7.1 ports are downmixed on stereo devices without SDL's
-  -13.5 dB front level.
-
-**2. Nexus: a ring of blue "?" models** ([`3248e372`](https://github.com/chenxiao07/KytyPS5/commit/3248e372),
-`src/libs/libAmpr.cpp` only)
-
-APR file ids were hashes of the guest path. The game resolves all of its ~250K files at start-up, 13
-pairs collided, and one file of each pair read the other's bytes: the Nexus arch model failed to load
-and the engine drew its default "?" model instead (some LODs, a collision mesh and a texture elsewhere
-were affected too). Ids are now assigned one per path. Upstream main (cdb64bfd, 2026-10-06) still hashes.
-
-![The Nexus ceiling before and after 3248e372: the ring of "?" models is gone](docs/images/nexus-question-marks.jpg)
-
-**3. Boletaria 1-1: the brazier's stone pillar and other missing objects**
-([`3b351932`](https://github.com/chenxiao07/KytyPS5/commit/3b351932))
-
-Indirect draws name a user SGPR (START_INST_LOC) that the command processor fills with the draw's
-start instance, and the shader's instance ID counts from 0. Both were ignored (the ID included
-firstInstance), so shaders that index per-object data with that SGPR read stale values: the stone
-pillar under the brazier at 1-1, rock faces there, the hall behind the cell windows of the Tower of
-Latria. The fix is in the shader recompiler (`Translate.cpp`, the SPIR-V emitter), `shader.cpp/.h`
-(the static key), `graphicsRun.cpp` / `hardwareContext.h` (the SGPR per draw) and `vulkanWindow.cpp`
-(`shaderDrawParameters`, `drawIndirectFirstInstance`); its `src/local` and `tools` changes only follow
-this fork's caches.
-
-![Boletaria 1-1 before and after 3b351932: the brazier floats without its stone pillar before the fix](docs/images/boletaria-pillar.jpg)
-
-# KytyPS5
-
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
-[![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
-
-KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
-with experimental macOS support. It is based on a heavily modified version of
-[Kyty](https://github.com/InoriRus/Kyty). The project is in an early stage of development, so
-compatibility is limited and behavior may change significantly between builds.
-
-> [!IMPORTANT]
-> KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
-> not distribute games or copyrighted system software. Use only game files that you have obtained
-> legally.
-
-## Current Status
-
-KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
-4/5, Unity, and custom engines. No external low-level emulation modules are currently required.
-
-Development is focused on compatibility and boot reliability.
-
-Windows is the primary platform and receives the most testing. Linux builds and runs; see
-[Building on Linux](#building-on-linux).
-
-macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
-Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
-on Apple Silicon hardware; see [Building on macOS](#building-on-macos).
-
-Community game test results are available in the
-[KytyPS5 Compatibility List](https://kytyps5.github.io/).
-
-## Bugs and Issues
-
-The project is in an early stage, so please be mindful when opening new issues. Expect crashes,
-graphical glitches, low compatibility, and poor performance.
-
-## Screenshots
-
-<table align="center">
-  <tr>
-    <td align="center">
-      <strong>Disgaea 6</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Disgaea 6 running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>Dreaming Sarah</strong><br>
-      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Neptunia ReVerse</strong><br>
-      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>SILENT HILL: The Short Message</strong><br>
-      <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Hellboy running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>Paleo Pines</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Paleo Pines running in KytyPS5">
-    </td>
-  </tr>
-</table>
-
-<p align="center"><em>And many more...</em></p>
-
-## Contributing
-
-Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Bug Report** template and attach the complete log file.
-
-Code contributions should be focused, build successfully on the platforms they touch, and include
-relevant tests where practical. Windows is the primary target, so a change that alters shared code
-should not regress it; changes confined to a platform's own code paths only need to build there. Because KytyPS5 is still evolving quickly, consider opening an issue before
-starting a large change.
-
-### Formatting
-
-Set up the clang-format hook after cloning:
-
-```powershell
-python -m pip install pre-commit
-python -m pre_commit install --install-hooks
-```
-
-It formats staged `.cpp`, `.h`, and `.inc` files in `src`.
-
-## Developer Information
-
-The PS5 graphics architecture is based on AMD RDNA 2. Use AMD's
-[RDNA 2 Instruction Set Architecture Reference Guide (document 70648)](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
-as the primary instruction-encoding reference when working on shader decoding and recompilation.
-
-Important areas of the codebase:
-
-- [`src/graphics/shader/recompiler`](src/graphics/shader/recompiler) — instruction decoding,
-  intermediate representation, control flow, resource tracking, and SPIR-V emission
-- [`src/graphics/guest_gpu`](src/graphics/guest_gpu) — PS5 (Prospero) GPU formats and command processing
-- [`src/graphics/host_gpu`](src/graphics/host_gpu) — Vulkan host backend and resource management
-- [`tests`](tests) — focused memory, shader, and resource-tracking regression tests
-
-The renderer targets Vulkan 1.3. Keep shader changes aligned with both the RDNA 2 ISA semantics and
-the Vulkan/SPIR-V validation rules.
-
-## Building
-
-### System requirements
-
-- Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
-- A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)
-- A Vulkan 1.3-capable GPU with current drivers (on macOS, Vulkan is provided by the bundled
-  MoltenVK)
-
-### Building with build-windows.cmd (Windows)
-
-The shortest way to a Release build of the emulator (without the Qt launcher):
-
-1. Install the tools once:
-   - Git: `winget install Git.Git`
-   - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload (its
-     **C++ CMake tools for Windows** component brings CMake and Ninja)
-   - LLVM 19 for `clang-cl`: `winget install LLVM.LLVM --version 19.1.7` (19.1.7 is tested; the
-     **C++ Clang tools for Windows** component of Visual Studio is used when LLVM is not installed;
-     LLVM 23.1.2 crashes compiling `agc.cpp`). Visual Studio 2026's C++ library needs Clang 20 or
-     newer (`STL1000: Unexpected compiler version`): with it, use its bundled `clang-cl` (no LLVM in
-     `Program Files`) or a newer LLVM.
-   - Vulkan SDK, for `glslangValidator`: `winget install KhronosGroup.VulkanSDK`
-   - Python 3: `winget install Python.Python.3.12`
-2. Clone and build from a new terminal (so that the tools are on `PATH`):
-
-   ```powershell
-   git clone --recurse-submodules https://github.com/chenxiao07/KytyPS5.git
-   cd KytyPS5
-   .\build-windows.cmd
-   ```
-
-   The script finds Visual Studio, `clang-cl` and the Vulkan SDK, checks out submodules that are
-   missing, configures `_Build\windows` the first time (CMake downloads xbyak, zydis, zstd and ZArchive) and builds
-   `_Build\windows\kyty_emulator.exe`. Run it again after changes for an incremental build;
-   `.\build-windows.cmd all` builds every target.
-3. Start a game with its folder (the one with `eboot.bin`; it is remembered in `game-path.txt`):
-
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\run-windows.ps1 -Game "D:\Games\PPSA01341-app0"
-   ```
-
-   The emulator switches come from `run-windows.json`; `-DryRun` prints the environment and the
-   command, `-Fullscreen`, `-Width`/`-Height` and the others are listed at the top of the script.
-   A ZArchive of the folder (`-Game D:\Games\PPSA01341-app0.zar`) works too, read without extracting
-   it; `.\build-windows.cmd zarchive_tool` builds the packer, `_Build\windows\3rdparty\zarchive.exe
-   <folder> <file.zar>`.
-
-The build is optimized for the CPU it is built on (`-march=native`). For an executable that other
-PCs can run, set `KYTY_CMAKE_ARGS=-DKYTY_MARCH=x86-64-v3` before the first configure. The release
-package is built that way by [`.github/workflows/build.yml`](.github/workflows/build.yml) when
-**Actions > Build KytyPS5 (Windows) > Run workflow** is started or a `v*` tag is pushed, and published as a
-release (pushes build nothing). [`.github/workflows/build-linux.yml`](.github/workflows/build-linux.yml)
-builds the Linux package the same way (a `v*` tag adds it to that tag's release).
-
-### Build requirements (Windows)
-
-- Git
-- CMake 3.12 or newer
-- Ninja
-- Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
-  **C++ Clang tools for Windows** component
-- The Vulkan SDK (`glslangValidator`) and Python 3
-- Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-
-The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
-
-Open an **x64 Native Tools Command Prompt for Visual Studio 2022** (or the equivalent Developer
-PowerShell), change to the repository root, and initialize the dependencies:
-
-```powershell
-git submodule update --init --recursive
-```
-
-Configure the project. Replace the Qt path with the version installed on your system:
-
-```powershell
-cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
-```
-
-Build the launcher and stage a runnable installation:
-
-```powershell
-cmake --build _Build/windows --target launcher
-cmake --install _Build/windows --prefix _Build/windows/install
-```
-
-The finished application and its runtime dependencies will be placed in
-`_Build/windows/install`.
-
-### Building on Linux
-
-`./build-linux.sh` builds the emulator alone (no Qt launcher) in one step: `./build-linux.sh` builds
-`kyty_emulator`, `./build-linux.sh kyty_shader_precompile` another target. It uses `-O3`, ThinLTO and
-`-march=x86-64-v3` for an executable other PCs can run (`KYTY_MARCH=native` for this CPU only). The
-manual steps below build the Qt launcher as well.
-
-Install the toolchain and the libraries the bundled SDL2 needs. Without the audio, Wayland and
-udev development packages SDL2 quietly configures itself without those backends, and the resulting
-build has no working sound and no gamepad hotplug:
-
-```bash
-sudo apt-get install --no-install-recommends \
-  clang lld ninja-build cmake git glslang-tools \
-  libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
-  libxi-dev libxrandr-dev libxss-dev libxkbcommon-dev \
-  libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
-```
-
-Qt 6 (Concurrent, Network, Widgets) is also required — either the distribution packages
-(`qt6-base-dev`) or an official Qt installation.
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
-
-cmake --build _Build/linux --target launcher --parallel
-cmake --install _Build/linux --prefix _Build/linux/install
-```
-
-The install step copies the Qt libraries and plugins next to the binaries, so
-`_Build/linux/install` runs without a matching system Qt.
-
-As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
-time.
-
-The CMake source root is the repository root.
-
-### Building on macOS
-
-macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game
-code executes through the same translation layer as the emulator itself. Prebuilt archives are
-attached to releases; the steps below are for building from source.
-
-Requirements:
-
-- An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
-- Xcode (or the Command Line Tools)
-- Homebrew packages: `brew install cmake ninja glslang`
-- Qt 6 (Concurrent, Network, Widgets) with x86-64 support. The official Qt installation is
-  universal and works; Homebrew's Qt is arm64-only and will not link
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
-
-cmake --build _Build/macos --target launcher --parallel
-cmake --install _Build/macos --prefix _Build/macos/install
-```
-
-The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required. When the launcher is built, the install
-also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
-A flat `kyty_emulator` is kept for CLI usage.
-
-Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
-[MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
-(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and ad-hoc sign it:
-
-```bash
-codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
-# For the bundle (if present):
-codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
-codesign --force --sign - _Build/macos/install/KytyPS5.app
-```
-
-Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
-
-### Regression tests
-
-Build every regression executable and run the registered tests with:
-
-```powershell
-cmake --build _Build/windows --target kyty_tests
-ctest --test-dir _Build/windows --output-on-failure
-```
-
-Use `_Build/linux` instead of `_Build/windows` for a Linux build.
-
-### Visual Studio Code
-
-A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
-Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
-compiler per platform, so on Linux configure from the command line as shown above.
-
-Before using it:
-
-1. Install the **CMake Tools** and **C/C++** extensions in Visual Studio Code.
-2. Update `CMAKE_PREFIX_PATH` in [`.vscode/settings.json`](.vscode/settings.json) to point to your
-   Qt 6 MSVC installation.
-3. Update the `--game` path in [`.vscode/launch.json`](.vscode/launch.json) for the
-   **Debug kyty_emulator** profile.
-4. Open the repository in an x64 Visual Studio developer environment, configure the CMake project,
-   and select a launch profile from **Run and Debug**.
-
-## Running
-
-Update your graphics driver before reporting rendering problems.
-
-To use the graphical launcher:
-
-```powershell
-.\_Build\windows\install\launcher.exe
-```
-
-```bash
-./_Build/linux/install/launcher
-```
-
-```bash
-open _Build/macos/install/KytyPS5.app  # or double-click in Finder
-```
-
-On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
-from the game list.
-
-The emulator can also be started directly with a legally obtained game directory or ELF file:
-
-```powershell
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
-```
-
-```bash
-./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
-```
-
-On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
-environment variable is required:
-
-```bash
-./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
-```
-
-To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
-
-```bash
-SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
-```
-
-Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
-debugging options.
-
-### AI Use
-
-AI tools may be used for research, reverse engineering, and development assistance. Contributors
-must fully understand, review, and test all code they submit and remain responsible for its
-correctness. Repository communication, including pull-request descriptions, code comments, and
-issue comments, must come from the human contributor rather than an autonomous AI agent.
-
-Pull requests that include AI-assisted or AI-generated work should disclose the scope of the AI
-involvement and describe the human review and testing performed before submission. Unverified or
-untested generated changes may be closed without review.
+# KytyPS5 for Demon's Souls
+
+A Windows build of the KytyPS5 PlayStation 5 emulator, tuned for one game: **Demon's Souls (PS5, PPSA01341)**.
+
+[chenxiao07's Demon's Souls branch of KytyPS5](https://github.com/chenxiao07/KytyPS5) is the foundation of this
+fork: the table path (GPU-driven draws), native XPR, the shader precompile, the graphics presets, the DualSense
+support and much more are his work. This fork builds on his v20261016b (commit `efc1efc7`) and adds **10-22%
+more speed** ([measured](#performance) against chen's own build), its own launcher, 1080p
+output modes, more graphics options and fixes, listed [below](#what-this-fork-adds).
+
+chen's branch is based on [KytyPS5](https://github.com/KytyPS5/KytyPS5), which is itself based on
+[Kyty](https://github.com/InoriRus/Kyty) by InoriRus.
+
+<!-- screenshot: the launcher's Home page -->
+<!-- screenshot: Demon's Souls in game (Boletaria 1-1, looking at the castle) -->
+
+## Download and play
+
+1. Download the zip from **[the Releases page](https://github.com/exploitz/KytyPS5/releases)**.
+2. Unzip it into a folder of its own with about 20 GB free, for example `C:\Games\KytyPS5` (not Program Files,
+   Downloads, Temp or OneDrive: the shader caches, logs and saves are kept inside it).
+3. Double-click **KytyPS5 Launcher.exe**. Windows may say it protected your PC (the programs are not signed):
+   click More info, then Run anyway.
+4. The first-run setup checks your PC, asks for **your own dump of the game** (the folder with `eboot.bin` and
+   `sce_sys`, usually `PPSA01341-app0`), picks settings for your screen and processor, and offers the shader
+   precompile (recommended once).
+5. Click **Play**.
+
+The guide inside the zip (also [docs/PORTABLE-README.md](docs/PORTABLE-README.md)) explains every setting, the
+first launch, performance tips and troubleshooting.
+
+### Game version
+
+| Game | Title ID | Versions |
+| --- | --- | --- |
+| Demon's Souls | PPSA01341 | 1.07 (01.007.000): tested with this fork. 1.05 (01.005.000): supported by chen's branch; this fork's additions were tested on 1.07 only (the lighting rule matches 1.07's shaders and does not apply to 1.05; the 1080p modes are untested there). Update to 1.07 if you can. |
+| Demon's Souls (US) | PPSA01342 | Same game patches and settings; untested. |
+
+The launcher reads the game's version and warns when it is not one of these.
+
+## Requirements
+
+| Part | Recommended | Notes |
+| --- | --- | --- |
+| Windows | Windows 10 (22H2) or 11, 64-bit | **Windows only** for now. Linux is planned; macOS is not supported. |
+| Processor (CPU) | With AVX2: Intel Core 4th generation, AMD Ryzen, or newer | Single-thread speed matters most (the emulator's render thread runs on one core). More threads make the shader precompile faster. |
+| Graphics card (GPU) | Vulkan 1.3, **12 GB of video memory** | 8 GB works, with lower frame rates in heavy areas. Tested on NVIDIA RTX; **AMD and Intel GPUs are untested**. |
+| Memory (RAM) | **32 GB** | 16 GB works, with slower loading. The emulator commits about 34 GB of RAM plus page file: leave the page file on "System managed size". |
+| Disk space | About 20 GB free, NTFS | Static precompile about 5.5 GB (one file: not FAT32/exFAT), translation store about 5 GB, driver cache about 1 GB. An SSD is recommended. |
+
+## What this fork adds
+
+Everything below sits on top of chen's work, which remains the foundation.
+
+1. **Faster GPU shaders.** The shader translator drops redundant per-lane masking work (EXEC-mask selects) that
+   most of the game's shaders carried: the largest single gain, +6-7% at Boletaria 1-1 and the Tower of Latria.
+2. **Translation store.** Translated shaders are kept on disk between launches, so later launches load them
+   instead of translating about 20,000 shaders again: loading takes about a minute.
+3. **Faster lighting.** A Demon's Souls-specific rule for four tile-lighting and fog compute shaders: the
+   lighting's GPU time at Boletaria 1-1 drops from 4.34 ms to 3.42 ms (+1.6% to +5.5% fps).
+4. **Its own texture-memory collector.** It decides which textures to drop when video memory runs short, keeps
+   textures that come back soon after being dropped, and sets its levels from your card's video memory budget:
+   about 4-5% faster than chen's collector in our Stonefang test.
+5. **A launcher.** First-run setup with a PC check and recommended settings, every setting explained, the shader
+   precompile and the game start with their progress inside the launcher, and a one-click problem report. On
+   Intel processors with efficiency cores it runs the precompile on the performance cores, about 2.5 times as fast
+   (154 to 61 minutes on the test PC).
+   It is a Qt application, ready for Linux.
+6. **1080p output modes with the HUD at its normal size.** Small patches to the game's code, applied at start
+   and located by the game's original bytes: "1080p Quality" renders the 1440p scene and scales it down,
+   "1080p Performance" renders at 1080p.
+7. **"Fewer shadows" graphics preset.** No ambient shadowing, no shadows from torches and other small lights,
+   sun shadows only up to 60 m; the scenery is left as it is. +12% (Boletaria 1-1), +15% (Tower of Latria),
+   +17% (Nexus). chen's Low and Lowest go further but swap some foreground objects for simpler ones.
+8. **FSR 4 anti-aliasing (experimental).** Replaces the game's TAA at the same resolution: cleaner edges, about
+   13% slower. Built from an older community-hosted FSR 4 "v07" source; **not AMD's official FSR 4**.
+9. **FSR 3.1 frame generation** (AMD FidelityFX, any GPU), with the HUD kept out of generated frames.
+10. **A faster memory allocator** (mimalloc) behind the emulator's own allocations: +1.4-2.5%.
+11. **Video memory kept under the card's budget.** A 12 GB card was treated as a small one (its usable budget reads
+    under 12 GB), which parked textures outside the counted memory and left the card paging in a new game and in
+    boss fights; textures the GPU made, which no collector could evict, are now swapped out to RAM under pressure
+    and restored when the game uses them again (RAM, not video memory, pays).
+12. **Keyboard and mouse play.** The mouse turns the camera in proportion to its speed (sensitivity in the
+    launcher), the first click in the window takes it and Esc gives it back; the mouse buttons attack, block and
+    lock on, the wheel switches spells and items; a PC key layout (Space rolls, E interacts, R uses the item, F
+    two-hands). See docs/PORTABLE-README.md, Controls.
+13. **Fixes.** A crash from the pause menu (a render target found again before use); a crash in the ATRAC9 audio decoder at the Shrine of Storms; 7.1 sound folded down to stereo
+    when your output is not 7.1, and the game's ambisonic sound objects decoded into the 7.1 mix; the game's
+    file reads on its own threads (a movie froze with the background reader); a translation store that grew at
+    every launch.
+
+**DLSS is not included.** NVIDIA's SDK license is not compatible with shipping it inside a GPL program. Using
+DLSS through NVIDIA's own Streamline download, which you would add yourself, is planned for a later release.
+**Trophies** are not recorded yet.
+
+<!-- screenshot: Standard vs Fewer shadows, same spot (Tower of Latria) -->
+
+## Performance
+
+chen's own build of his commit `6bae2db5` against this fork's exe built on the same commit. (The release adds his
+next two commits, `4254fb56` and `30d2d2cb`, which open the game's files ahead while it loads: they change loading,
+not the frame rate.)
+
+- Settings: PS5 Performance mode (1440p scene, 4K output), frame rate uncapped for measuring.
+- Test PC: Intel Core i9-12900K, NVIDIA GeForce RTX 3080 Ti, 64 GB RAM, Windows 11.
+- Builds: chen's with his PGO profile for this CPU (`-march=native`); this fork's release exe (`-march=x86-64-v3`,
+  any AVX2 CPU) with the same profile.
+- Method: both builds' shader caches warm first, then rounds in mirrored order (chen's build first and last).
+  Each figure averages the two rounds of that build (2026-10-15).
+
+| Area | chen's build | This fork | Change |
+| --- | ---: | ---: | ---: |
+| Boletaria 1-1, standing | 42.5 | 48.2 | +13% |
+| Boletaria 1-2, standing | 43.6 | 53.0 | +22% |
+| Tower of Latria, standing | 45.6 | 50.3 | +10% |
+| Shrine of Storms beach, standing | 48.1 | 56.0 | +16% |
+| Nexus, standing | 56.5 | 66.4 | +17% |
+| Stonefang 2-1, camera turning | 65.6 | 73.9 | +13% |
+| Shrine of Storms beach, camera turning | 61.9 | 69.3 | +12% |
+| Boletaria 1-1, camera turning | 56.3 | 64.3 | +14% |
+| Boletaria 1-2, camera turning | 60.7 | 69.5 | +15% |
+| Nexus, camera turning | 52.2 | 58.7 | +12% |
+
+- The 1% lows (the slowest frames) are better in every area.
+- At the normal 60 fps limit most areas hold 60 fps while moving on this PC; the heaviest views, such as
+  Boletaria 1-1 looking at the castle, run in the high 40s.
+
+Results vary by PC: the CPU's single-thread speed matters most, then the graphics card.
+
+## Settings
+
+| Setting | Choices | In short |
+| --- | --- | --- |
+| Output | 4K (PS5) / 1080p Quality / 1080p Performance | The picture the game makes: 4K as on PS5, or 1080p with the HUD at its normal size. |
+| 3D resolution | 1440p (PS5) down to 900p | With the 4K output: a smaller 3D scene for weaker graphics cards. |
+| Aspect ratio | 16:9 (PS5) / 21:9 / 32:9 | With the 4K output: the 3D rendered wider for ultrawide screens (chen's). |
+| Graphics detail | Standard (PS5) / Fewer shadows / Low / Lowest | Less to draw for slower CPUs; Fewer shadows keeps the scenery. |
+| Anti-aliasing | Game TAA / FSR 4 (experimental) | FSR 4: cleaner edges, about 13% slower. |
+| Frame generation | Off / FSR 3.1 | Smoother motion, a little more input lag. |
+| Display mode | Fullscreen / window sizes | F11 or Alt+Enter switches in game. |
+| Keep 16:9 | On / Off | Black bars on ultrawide and 16:10 screens. |
+| Frame rate limit | 60 (PS5) / 120 | 120: above 60 where your PC can; movies and menus stay at 60. |
+| VSync | Off / On | On: no tearing; G-SYNC/FreeSync keep adapting. |
+| HDR | Off / On | Needs Windows HDR on for the display. |
+| Performance overlay | Off / Frame rate / Detailed | The emulator's own frame rate and frame-time panel. |
+| Language | the PS5 console languages | The game's text and voices. |
+
+## Testing and reporting problems
+
+This release is tested on one PC. Reports from other hardware help most, AMD and Intel graphics cards, AMD
+processors, laptops and Windows 10 above all. If something goes wrong, click **Report a problem** in the
+launcher: it saves a zip with the logs and a summary of your PC to your Desktop and opens a
+[new issue](https://github.com/exploitz/KytyPS5/issues/new/choose); attach the zip. The zip leaves your Windows
+user name out of folder paths (`C:\Users\<user>`). Please report problems with this fork here, not to chen or to the
+KytyPS5 project.
+
+## Building from source
+
+The release is built for Windows x64 with the scripts in `tools/release`:
+
+1. Install once: Git; Visual Studio 2022 or newer with the **Desktop development with C++** workload (its
+   **C++ CMake tools** and **C++ Clang tools** components); the Vulkan SDK (`winget install
+   KhronosGroup.VulkanSDK`); Python 3; and for the launcher, Qt 6.8 for MSVC x64 (for example
+   `pip install aqtinstall`, then `aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 -O C:\Qt`).
+2. Clone with submodules: `git clone --recurse-submodules https://github.com/exploitz/KytyPS5.git`.
+3. Build:
+   - `tools\release\build-release.cmd`: the emulator and the precompile program for any AVX2 CPU
+     (`-march=x86-64-v3`), without NVIDIA's SDKs, with the repository's PGO profile, in `_Build\windows-release`.
+   - `tools\release\build-launcher.cmd`: the launcher and its Qt files, in `_Build\fork-launcher\deploy`
+     (`KYTY_QT_DIR` if Qt is not in `C:\Qt\6.8.3\msvc2022_64`).
+   - `powershell -File tools\release\package-release.ps1 -Version <version>`: the release folder and zip in
+     `_Build\package`, with every license. It needs the FidelityFX and FSR 4 run-time files in
+     `_Build\windows\deps\fsr` and `deps\fsr4` (not part of the repository).
+4. For development, `build-windows.cmd` builds `_Build\windows\kyty_emulator.exe` for the CPU it is built on
+   (`.\build-windows.cmd all` for every target), and `run-windows.ps1 -Game <folder>` starts it.
+   Regression tests: `cmake --build _Build/windows --target kyty_tests`, then
+   `ctest --test-dir _Build/windows --output-on-failure`.
+
+## How this fork was made
+
+This fork was developed with heavy use of AI assistance (Anthropic's Claude), directed and play-tested by its
+maintainer. Every performance change was measured on real hardware with alternating A/B runs before it was
+kept, and changes that did not measurably help were reverted; the numbers above come from those runs. Reviews,
+bug reports and pull requests are welcome.
+
+## Credits
+
+- **[chenxiao07](https://github.com/chenxiao07/KytyPS5)**: the Demon's Souls branch this fork builds on, and
+  nearly all of the emulator's Demon's Souls performance work.
+- **[The KytyPS5 developers](https://github.com/KytyPS5/KytyPS5)**: the emulator itself.
+- **[InoriRus](https://github.com/InoriRus/Kyty)**: the original Kyty, which KytyPS5 is based on.
+- **[shadPS4](https://github.com/shadps4-emu/shadPS4)**: credited by KytyPS5 as a reference for the memory
+  model and the AVPlayer implementation; its FFmpeg build is used here.
+- **AMD FidelityFX SDK** (MIT): FSR 3.1 frame generation. **FSR-Vulkan** (MIT): the Vulkan provider for the
+  experimental FSR 4 option. **Qt** (LGPL-3.0): the launcher.
+- The other third-party components and their licenses are in `3rdparty` and, in a release, `LICENSES`.
 
 ## License
 
-KytyPS5 is licensed under the [GNU General Public License version 2](LICENSE)
-(`GPL-2.0-only`).
+This fork, like KytyPS5, is licensed under the [GNU General Public License version 2](LICENSE)
+(`GPL-2.0-only`). The source code for every release is in this repository.
 
-This project is based on the original [Kyty](https://github.com/InoriRus/Kyty), which was released
-under the MIT License. Kyty's original copyright and license notice are preserved in
-[`LICENSES/Kyty-MIT.txt`](LICENSES/Kyty-MIT.txt). Third-party components remain subject to the
-licenses included with those components.
+KytyPS5 is based on the original [Kyty](https://github.com/InoriRus/Kyty), released under the MIT License; its
+copyright and license notice are preserved in [`LICENSES/Kyty-MIT.txt`](LICENSES/Kyty-MIT.txt). Third-party
+components remain subject to their own licenses.
 
-## Special Thanks
+## Legal
 
-- [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
-  of the original Kyty project.
-- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for memory-model
-  understanding and the AVPlayer implementation.
+- This project includes **no game files**, no console firmware and no keys. Use only a dump made from
+  **your own copy** of the game.
+- The shader list files the launcher makes from your game (`seeds-*.seeds`, `hinted-*.seeds`) contain the
+  game's shader code. Do not share them.
+- This project is not affiliated with or endorsed by Sony Interactive Entertainment, Bluepoint Games, NVIDIA or
+  AMD. PlayStation, Demon's Souls, FSR, FidelityFX, FreeSync, DLSS and G-SYNC are trademarks of their
+  respective owners.

@@ -957,9 +957,33 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		bool        uniform_loads = false;
 		result.lane_local         = enabled && IsWaveLaneLocal(decoded, log ? &reason : nullptr, &uniform_loads);
 		result.lane_local_uniform_loads = result.lane_local && uniform_loads;
+		// Demon's Souls' tile lighting (KYTY_LANE_LOCAL_TITLE=0: as the proof decides). The proof refuses these three:
+		// each ORs its lanes' light masks across the wave (all lanes enabled by S_ORN2_SAVEEXEC, the halves joined by
+		// V_READLANE 31 and 63) and walks the union, and one also reads a lane value with V_READFIRSTLANE. Lane-local, a
+		// half walks the union of its own lanes' masks (ReadLane reads its own lane 31), which holds every light of each
+		// of its lanes; a light outside a lane's cluster adds nothing to it. Checked against still views of 1-1, 1-2,
+		// Latria and Shrine (10-14, pictures within run-to-run noise): the lighting's GPU time 4.34 -> 3.42 ms at 1-1,
+		// fps +1.6..+5.5% (the GPU tail the game's readbacks wait behind ends sooner). The hashes are of these exact
+		// programs, so no other title matches.
+		static const bool title = [] {
+			const char* value = std::getenv("KYTY_LANE_LOCAL_TITLE");
+			return value == nullptr || value[0] != '0';
+		}();
+		// (f0dc79c3467d5e0b: the 214x120x72 fog volume, refused for LDS: its lanes exchange through LDS without a barrier, as
+		// one wave may; checked like the lighting, 10-14: 1-1 +3.5%, Shrine 0%, pictures within noise.)
+		constexpr std::array<uint64_t, 4> TitleLaneLocal {0x7e676bf37482d768ull, 0xdecd2b04b5eee050ull, 0xa3ecbeb1830c210cull,
+		                                                  0xf0dc79c3467d5e0bull};
+		if (!result.lane_local && enabled && title &&
+		    std::find(TitleLaneLocal.begin(), TitleLaneLocal.end(), options.shader_hash) != TitleLaneLocal.end()) {
+			result.lane_local = true;
+			reason            = "title list";
+		}
 		if (log)
 			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash),
-			            result.lane_local ? (uniform_loads ? "yes (uniform loads)" : "yes") : reason.c_str());
+			            !result.lane_local       ? reason.c_str()
+			            : reason == "title list" ? "yes (title list)"
+			            : uniform_loads          ? "yes (uniform loads)"
+			                                     : "yes");
 	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;

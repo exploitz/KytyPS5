@@ -77,6 +77,7 @@ static int Usage() {
 	std::fprintf(stderr, "usage: kyty_shader_precompile --game <dir> --seeds <file> [--shard <i>/<n>] "
 	                     "[--threads <n>] [--out <file> | --static-inputs] [--timings <file>] [--no-pipelines] "
 	                     "[--dry-run] [--plan <file>] [--native-variants [--native-guesses]]\n"
+	                     "       [--validate | --shader-validation] [--amd]\n"
 	                     "       kyty_shader_precompile --game <dir> --merge [--prune] [--keep-shards]\n"
 	                     "       kyty_shader_precompile --game <dir> --seeds <file> --status\n"
 	                     "       kyty_shader_precompile --game <dir> --make-seeds <file> [--states <pass-states.json>] "
@@ -128,7 +129,7 @@ int main(int argc, char* argv[]) {
 			// 64-lane host subgroups and shader-side storage buffer bounds (with --no-pipelines on another GPU).
 			options.host_subgroup_size = 64;
 			amd = true;
-		} else if (arg == "--validate") {
+		} else if (arg == "--validate" || arg == "--shader-validation") { // (ours was --shader-validation)
 			validate = true;
 		} else if (arg == "--static-inputs") {
 			options.static_inputs = true;

@@ -2,8 +2,12 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "libs/ajm/atrac9_padded.h"
 #include "libs/ajm/decoder.h"
 
+#include <cstdlib>
+#include <cstdio>
+#include <atomic>
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -174,26 +178,69 @@ public:
 				break;
 			}
 
+			// A full output buffer with input left over is a normal end of a job: the game sizes
+			// the output for the PCM it wants (12 frames) and hands over whatever input it has
+			// buffered, then continues from input_consumed. Reporting NOT_ENOUGH_ROOM for that
+			// made Demon's Souls' sample player assert (its "impossible result" trap ends the
+			// process with a fault at address -1). The flag is only for a buffer too small for
+			// even one frame, when nothing was produced.
 			const auto frame_output_bytes = FrameOutputBytes(gapless);
 			if (frame_output_bytes != 0 && output == nullptr) {
-				result.result |= AJM_RESULT_NOT_ENOUGH_ROOM;
+				if (result.frames == 0) result.result |= AJM_RESULT_NOT_ENOUGH_ROOM;
 				break;
 			}
 			if (frame_output_bytes == 0 && !FrameCanProduceNoOutput(gapless)) {
-				result.result |= AJM_RESULT_NOT_ENOUGH_ROOM;
+				if (result.frames == 0) result.result |= AJM_RESULT_NOT_ENOUGH_ROOM;
 				break;
 			}
 			if (output_size - result.output_written < frame_output_bytes) {
-				result.result |= AJM_RESULT_NOT_ENOUGH_ROOM;
+				if (result.frames == 0) result.result |= AJM_RESULT_NOT_ENOUGH_ROOM;
 				break;
 			}
 
 			int       bytes_used = 0;
 			const int ret        = DecodeFrame(input_bytes + input_offset, &bytes_used);
 			if (ret != 0) {
+				// A frame the decoder cannot unpack (libatrac9 rejects some frames of Demon's
+				// Souls' stereo streams with ERR_UNPACK_SCALE_FACTOR_MODE_INVALID, deterministically
+				// for the same bytes) is concealed: one frame of silence, the superframe consumed,
+				// decoding continues. A fatal result instead made the game's sample player
+				// assert and end the process. KYTY_AJM_STRICT=1 restores the fatal result.
+				static const bool strict = [] {
+					const char* v = std::getenv("KYTY_AJM_STRICT");
+					return v != nullptr && v[0] == '1';
+				}();
+				if (strict || m_superframe_bytes_remain == 0 ||
+				    remaining_input < m_superframe_bytes_remain) {
 				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 				result.internal_result = ret;
 				break;
+			}
+				static std::atomic<uint32_t> concealed {0};
+				if (const auto n = concealed.fetch_add(1, std::memory_order_relaxed) + 1;
+				    (n & (n - 1)) == 0) {
+					std::printf("AJM ATRAC9: %u undecodable frame(s) concealed (last error 0x%08x)\n",
+					            n, static_cast<unsigned>(ret));
+				}
+				std::fill(m_pcm_buffer.begin(), m_pcm_buffer.end(), 0);
+				// Consume the rest of the superframe and count it complete, so the next frame
+				// starts aligned on the following superframe.
+				bytes_used   = static_cast<int>(m_superframe_bytes_remain);
+				m_num_frames = static_cast<uint32_t>(std::max(m_codec_info.framesInSuperframe, 1)) - 1;
+				// The codec's inter-frame state is unreliable after a rejected frame: a new handle, the stream's
+				// position kept (InitializeConfig starts a stream: no frames, a whole superframe to come).
+				if (m_handle != nullptr && m_has_config) {
+					const auto frames  = m_num_frames;
+					const auto remain  = m_superframe_bytes_remain;
+					const auto samples = m_total_decoded_samples;
+					Atrac9ReleaseHandle(m_handle);
+					m_handle = Atrac9GetHandle();
+					auto reinit = MakeResult();
+					(void)InitializeConfig(m_config_data, &reinit);
+					m_num_frames              = frames;
+					m_superframe_bytes_remain = remain;
+					m_total_decoded_samples   = samples;
+				}
 			}
 			if (bytes_used <= 0 || static_cast<size_t>(bytes_used) > remaining_input ||
 			    static_cast<uint32_t>(bytes_used) > m_superframe_bytes_remain) {
@@ -377,11 +424,16 @@ private:
 		return true;
 	}
 
-	int DecodeFrame(const uint8_t* input, int* bytes_used) {
-		if (!m_channel_handles.empty()) {
-			return DecodeChannelsFrame(input, bytes_used);
-		}
-		return DecodeWith(m_handle, input, m_pcm_buffer.data(), bytes_used);
+	// The callers have checked that the superframe's remaining bytes are all in the input; libatrac9 reads a
+	// padded copy of them (atrac9_padded.h: it loads whole words past a frame's end; a multichannel frame's last
+	// channel block too).
+	int DecodeFrame(const uint8_t* guest_input, int* bytes_used) {
+		return DecodeAtrac9FramePadded(m_frame_input, guest_input, GetMinimumInputSize(), [&](const uint8_t* input) {
+			if (!m_channel_handles.empty()) {
+				return DecodeChannelsFrame(input, bytes_used);
+			}
+			return DecodeWith(m_handle, input, m_pcm_buffer.data(), bytes_used);
+		});
 	}
 
 	int DecodeWith(void* handle, const uint8_t* input, uint8_t* pcm, int* bytes_used) const {
@@ -635,6 +687,7 @@ private:
 	uint32_t             m_num_frames              = 0;
 	Atrac9CodecInfo      m_codec_info {};
 	std::vector<uint8_t> m_pcm_buffer;
+	std::vector<uint8_t> m_frame_input; // DecodeFrame's padded copy of the guest bytes
 	// A multichannel stream (At9ParseMultiConfig): a mono decoder per channel, the bytes each channel used of the
 	// superframe so far and its share of it, and one channel's frame before it is interleaved.
 	std::vector<void*>    m_channel_handles;

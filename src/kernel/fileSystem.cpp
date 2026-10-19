@@ -552,7 +552,8 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		} else {
 			// Debug warp (loader/demonsSoulsWarp.h): a read of the save gets a copy on the chosen map; the
-			// game's command-line file gets the console variables of KYTY_GAME_CONVARS (loader/gameArgs.h).
+			// game's command-line file and graphics-mode presets get the console variables of KYTY_GAME_CONVARS
+			// and KYTY_RENDER_CONVARS (loader/gameArgs.h).
 			auto open_name = file->real_name;
 			if (rw_mode == Common::File::Mode::Read) {
 				if (auto copy = Loader::DemonsSoulsWarp::RedirectRead(file->real_name); !copy.empty()) {

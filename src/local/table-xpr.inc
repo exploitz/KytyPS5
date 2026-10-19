@@ -484,6 +484,16 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 		return Spec::Refuse("table: stages"), TableResult::Native;
 	const auto frame      = m_context.FrameNumber();
 	const auto vs_address = vs.es_regs.data_addr, ps_address = sh.GetPs().ps_regs.data_addr;
+	// Frame generation takes each frame's camera from its first G-buffer draw on the native path (FrameGen::OnDraw
+	// reads the SRT this path leaves on the GPU): without it FSR's generation went off whenever every G-buffer draw
+	// of a frame took this path.
+	if (FrameGen::Enabled() && FrameGen::WantsDraw(ShaderHashAt(vs_address))) return TableResult::Native;
+	// The final composite too: the native path draws it once more with the HUD layer cleared first (FrameGen::SaveHud,
+	// CaptureHudless). Without that frame FSR's generated frames moved the HUD with the scene ("HUD-less colour not
+	// available"; the composite took this path since the 10-07 merge).
+	if (FrameGen::Enabled() && ps_address != 0 && FrameGen::HudlessWanted() &&
+	    FrameGen::IsFinalCompositeShader(ShaderHashAt(ps_address)))
+		return TableResult::Native;
 	const std::array<uint64_t, 3> pair_key {vs_address, ps_address, static_cast<uint32_t>(vs.start_instance_user_sgpr)};
 	auto* own   = Role() != 0 ? nullptr : &table.pairs;
 	auto* known = own != nullptr && table.found_key == pair_key ? table.found_pair : nullptr;
@@ -2438,6 +2448,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	TableSweepPairs();
 	const auto& sh    = buffer.GetShaders();
 	const auto& cs    = sh.GetCs();
+	// Frame generation reads its depth and motion from the TAA dispatch's bindings on the normal path
+	// (FrameGen::OnDispatch); every other dispatch may take this path with it on.
+	if (FrameGen::Enabled() && FrameGen::IsTaaShader(ShaderHashAt(cs.cs_regs.data_addr)))
+		return m_dispatch_declined = "dispatch: frame generation's TAA", false;
 	const auto  words = TableDispatchWords(cs, thread_dimensions);
 	// (The pair found last again without its hash or lookup: runs of dispatches keep their program. A pointer stays
 	// valid until TableSweepPairs, which drops this one; the main executor's own catalog only.)

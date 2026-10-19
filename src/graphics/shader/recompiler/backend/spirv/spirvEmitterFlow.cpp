@@ -100,8 +100,17 @@ uint32_t EmitBuiltinU32(ValueEmitContext& ctx, IR::StageInputKind kind, uint32_t
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction({OpLoad, TypeBool(state), value, variable});
-		state.builder.AddFunction(
-		    {OpSelect, TypeU32(state), bits, value, ConstantU32(state, 1), ConstantU32(state, 0)});
+		// The integers 1 / 0 (front / back). KYTY_FRONT_FACE_FLOAT=1: the float bits of +1.0 / -1.0 instead
+		// (upstream 7b5a33f8, "the PS5 initializes v_front_face with" them; 226 of 2,803 recorded Demon's Souls pixel
+		// shaders read it). Off by default since 10-13: with the float bits, either sign, the 1-1 gate banners came
+		// out pale; a PS5 reference capture has them dark navy, as the integers (and chen's tree) draw them.
+		static const bool float_bits = [] {
+			const char* value = std::getenv("KYTY_FRONT_FACE_FLOAT");
+			return value != nullptr && value[0] == '1';
+		}();
+		state.builder.AddFunction({OpSelect, TypeU32(state), bits, value,
+		                           ConstantU32(state, float_bits ? 0x3f800000u : 1u),
+		                           ConstantU32(state, float_bits ? 0xbf800000u : 0u)});
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
@@ -652,6 +661,12 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		case IR::ValueOpcode::ReadLane:
+			if (state.program.lane_local) {
+				// (Only a title-listed program reads a lane lane-local, Translate.cpp: the half's own lane 31 for lane 63.)
+				const auto lane = EmitBinaryU32(state, OpBitwiseAnd, ctx.Arg(inst, 1), ConstantU32(state, 31));
+				ctx.Define(inst, ctx.Shuffle(inst, 0, lane));
+				return true;
+			}
 			if (IsWaveOrScanRead(ctx, inst)) {
 				static std::atomic<uint32_t> logged {0};
 				if (logged.fetch_add(1) < 64)

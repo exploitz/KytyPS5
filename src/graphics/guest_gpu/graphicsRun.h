@@ -38,6 +38,7 @@ public:
 	                         std::span<const uint32_t> constant_commands);
 	void              SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void              SubmitFlipPreparation(uint64_t request_id);
+	void              AdvanceFrameAfterGpuFlip();
 	void              Done();
 	[[nodiscard]] int GetFrameNum() const;
 

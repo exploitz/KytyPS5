@@ -60,6 +60,9 @@ param(
 	[switch]$Quick,
 	[switch]$Full,
 	[switch]$InputsOnly,
+	# Keep the pipelines of the binaries this run started from that no seed made (another switch set's, e.g.
+	# KYTY_EXEC_DEMAND on and off) instead of pruning them.
+	[switch]$NoPrune,
 	# The specialization hints of this PC's play (its warmup recordings, without the game's code) into
 	# my-hints-<title>_<version>.hints next to this script, nothing compiled: attached to an issue, the next releases'
 	# hints hold them (places and effects the test PC never recorded: a boss's death compiled ~75 s on an AMD GPU).
@@ -68,6 +71,18 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
+# The switches of the launch config that change what the shader translator makes (the translation store's key,
+# pipelineCache.cpp StoreSwitches): the shaders are precompiled as the game will translate them (KYTY_EXEC_DEMAND=1 in
+# this fork's run-windows.json), else their pipelines would not be the ones play looks up. Set already: kept.
+$launchConfig = @("$PSScriptRoot\launch.json", "$PSScriptRoot\run-windows.json") | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($launchConfig) {
+	$launchEnvironment = (Get-Content $launchConfig -Raw | ConvertFrom-Json).environment
+	foreach ($name in 'KYTY_EXEC_DEMAND', 'KYTY_FRONT_FACE_FLOAT', 'KYTY_PORTABLE_SHADERS', 'KYTY_LANE_LOCAL', 'KYTY_LANE_LOCAL_TITLE',
+		'KYTY_LANE_LOCAL_UNIFORM_LOADS', 'KYTY_PS_WAVE_OR') {
+		$value = if ($launchEnvironment) { $launchEnvironment.$name }
+		if ($value -and !(Test-Path "env:$name")) { Set-Item "env:$name" ([string]$value) }
+	}
+}
 # The AMD driver keys its pipelines (VK_KHR_pipeline_binary keys, its pipeline cache) by the executable's name: what
 # kyty_shader_precompile.exe compiled, kyty_emulator.exe never found (10-16, RX 9070 XT: 0 of every pipeline the game
 # made). The program runs as a copy named like the emulator (its DLLs next to it), on any GPU.
@@ -225,6 +240,16 @@ if ($Affinity -eq 0) {
 		Select-Object -First 1
 	foreach ($cpu in (Get-Content $config -Raw | ConvertFrom-Json).cpu_affinity) { $Affinity = $Affinity -bor ([int64]1 -shl [int]$cpu) }
 }
+Add-Type -Namespace Kyty -Name PowerThrottling -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct STATE { public uint Version; public uint ControlMask; public uint StateMask; }
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInformationClass, ref STATE ProcessInformation, int ProcessInformationSize);
+public static bool Disable(IntPtr process) {
+	STATE state = new STATE { Version = 1, ControlMask = 1, StateMask = 0 };
+	return SetProcessInformation(process, 4, ref state, Marshal.SizeOf(typeof(STATE)));
+}
+'@
 $all = if ([Environment]::ProcessorCount -ge 64) { [int64]-1 } else { ([int64]1 -shl [Environment]::ProcessorCount) - 1 }
 $mask = $Affinity -band $all
 if ($mask -eq 0) { $mask = $all }
@@ -246,8 +271,13 @@ function Start-Precompile([string]$name, [string[]]$arguments) {
 	New-Item -ItemType Directory -Force $env:__GL_SHADER_DISK_CACHE_PATH | Out-Null
 	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
-	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+	# Normal priority: Windows parks below-normal processes on the E-cores of a hybrid CPU (2026-10-03).
+	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
 	$process.ProcessorAffinity = [IntPtr]$mask
+	# Power throttling (EcoQoS) off: a windowless batch process otherwise counts as background work and
+	# the hybrid scheduler keeps it on the E-cores whatever its priority (SetProcessInformation,
+	# ProcessPowerThrottling); -Affinity 0xFFFF (the P-cores) is the fallback when it still does.
+	[Kyty.PowerThrottling]::Disable($process.Handle) | Out-Null
 	$null = $process.Handle # keeps the exit code readable after the process ends
 	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru
 }
@@ -367,9 +397,10 @@ while ($first.Count -or $second.Count -or $running.Count) {
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
-# (-Quick: what the store held of the other shaders stays.)
+# (-Quick: what the store held of the other shaders stays; -NoPrune (precompile-des.ps1 -ExecDemand): the other
+# setting's pipelines stay.)
 $mergeArguments = @('--merge')
-if (!$Quick) { $mergeArguments += '--prune' }
+if (!$Quick -and !$NoPrune) { $mergeArguments += '--prune' }
 Wait-Precompile (Start-Precompile 'merge' $mergeArguments) 'merge'
 if ($Quick) { Wait-Precompile (Start-Precompile 'inputs' $inputs) 'inputs' }
 $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSScriptRoot\_PipelineCache\static\$gameId.binaries",

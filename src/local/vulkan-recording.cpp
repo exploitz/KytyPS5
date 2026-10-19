@@ -7,6 +7,13 @@
 #include "time-census.h"
 
 #include <array>
+// The renderer call site tagged on a GPU mark.
+#if defined(_WIN32)
+#include <intrin.h>
+#define KYTY_RETURN_ADDRESS() _ReturnAddress()
+#else
+#define KYTY_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
 #include <atomic>
 #include <chrono>
 #include <cstddef>

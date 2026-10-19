@@ -45,6 +45,8 @@ struct Sources {
 
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
 bool     g_ready       = false; // Streamline loaded and the feature available
+bool     g_external    = false; // the inputs feed another generator (FSR)
+bool     g_camera_only = false; // the camera alone (FSR 4 upscaling)
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
 uint64_t g_guest_frame = 0;     // Kyty.Gpu
@@ -93,7 +95,7 @@ void Transition(vk::CommandBuffer command, VulkanImage& image, vk::ImageAspectFl
 // (Re)create `image` as a sampled copy target like `source`; with `attachment`, a color
 // attachment too where the format allows it (*attachment tells).
 void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view,
-               const VulkanImage& source, bool* attachment = nullptr) {
+               const VulkanImage& source, bool* attachment = nullptr, vk::ImageUsageFlags extra_usage = {}) {
 	if (image.image != nullptr && image.format == source.format &&
 	    image.extent.width == source.extent.width && image.extent.height == source.extent.height) {
 		return;
@@ -113,7 +115,7 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 	create.format        = source.format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+	create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled | extra_usage;
 	if (attachment != nullptr) {
 		*attachment = !IsDepthFormat(source.format) &&
 		              static_cast<bool>(graphics.physical_device.getFormatProperties(source.format).optimalTilingFeatures &
@@ -154,6 +156,21 @@ void CopyInto(vk::CommandBuffer command, Image& source, VulkanImage& target) {
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 	Transition(command, target, aspect, vk::ImageLayout::eShaderReadOnlyOptimal,
 	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+}
+
+// The HUD-less capture (HudlessWanted), Kyty.Gpu: the HUD layer's copy while the final composite is
+// drawn without it, and this guest frame's HUD-less image until the flip copies it into the inputs.
+VulkanImage   g_hud_saved, g_hudless;
+vk::ImageView g_hud_saved_view = nullptr, g_hudless_view = nullptr;
+bool          g_hudless_ready = false;
+
+// A copy between two images of one extent and format, `source` in `source_layout` throughout.
+void CopyWhole(vk::CommandBuffer command, vk::Image source, vk::ImageLayout source_layout, VulkanImage& target) {
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = target.extent;
+	command.copyImage(source, source_layout, target.image, vk::ImageLayout::eTransferDstOptimal, copy);
 }
 
 // KYTY_FPS_HUD: frames shown per presented frame, and the panel's normalized rectangle (16 bits
@@ -355,7 +372,19 @@ bool FeatureFunction(sl::Feature feature, const char* name, F*& function) {
 } // namespace
 
 bool Enabled() {
-	return g_ready;
+	return g_ready || g_external || g_camera_only;
+}
+
+void EnableInputs() {
+	g_external = true;
+}
+
+void EnableCamera() {
+	g_camera_only = true;
+}
+
+const Camera* CurrentCamera() {
+	return g_camera.valid ? &g_camera : nullptr;
 }
 
 bool Requested() {
@@ -793,6 +822,11 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	g_camera.valid      = true;
 }
 
+bool WantsDraw(uint64_t vs_hash) {
+	return !g_camera.valid &&
+	       std::find(GbufferVertexShaders.begin(), GbufferVertexShaders.end(), vs_hash) != GbufferVertexShaders.end();
+}
+
 void NoteScene() {
 	g_scene.store(true, std::memory_order_relaxed);
 }
@@ -820,15 +854,102 @@ void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId
 	g_sources = {depth, motion, depth_address, motion_address, true};
 }
 
+bool HudlessWanted() {
+	static const bool off = [] {
+		const char* value = std::getenv("KYTY_FRAMEGEN_FSR_HUDLESS");
+		return value != nullptr && value[0] == '0';
+	}();
+	return g_external && !off;
+}
+
+void SaveHud(GraphicContext& graphics, vk::CommandBuffer command, Image& hud) {
+	const auto found = hud.backing.state;
+	Configure(graphics, g_hud_saved, g_hud_saved_view, hud.backing, nullptr, vk::ImageUsageFlagBits::eTransferSrc);
+	hud.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command);
+	Transition(command, g_hud_saved, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	CopyWhole(command, hud.backing.image, vk::ImageLayout::eTransferSrcOptimal, g_hud_saved);
+	hud.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	const vk::ClearColorValue       transparent {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	command.clearColorImage(hud.backing.image, vk::ImageLayout::eTransferDstOptimal, &transparent, 1, &range);
+	hud.Transit(found.layout, found.access_mask, {}, command);
+}
+
+void CaptureHudless(GraphicContext& graphics, vk::CommandBuffer command, Image& target, Image& hud) {
+	const auto target_found = target.backing.state;
+	const auto hud_found    = hud.backing.state;
+	Configure(graphics, g_hudless, g_hudless_view, target.backing, nullptr, vk::ImageUsageFlagBits::eTransferSrc);
+	target.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command);
+	Transition(command, g_hudless, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	CopyWhole(command, target.backing.image, vk::ImageLayout::eTransferSrcOptimal, g_hudless);
+	Transition(command, g_hudless, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	target.Transit(target_found.layout, target_found.access_mask, {}, command);
+	// The HUD layer back as the game drew it.
+	Transition(command, g_hud_saved, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	hud.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = g_hud_saved.extent;
+	command.copyImage(g_hud_saved.image, vk::ImageLayout::eTransferSrcOptimal, hud.backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	hud.Transit(hud_found.layout, hud_found.access_mask, {}, command);
+	g_hudless_ready = true;
+}
+
+void BlitHudless(GraphicContext& graphics, vk::CommandBuffer command, FrameInputs& inputs, vk::Extent2D backbuffer,
+                 vk::Format format, vk::Rect2D region) {
+	inputs.hudless_backbuffer_valid = false;
+	if (!inputs.hudless_valid || backbuffer.width == 0 || backbuffer.height == 0) return;
+	VulkanImage shape {};
+	shape.format = format;
+	shape.extent = vk::Extent3D {backbuffer.width, backbuffer.height, 1};
+	Configure(graphics, inputs.hudless_backbuffer, inputs.hudless_backbuffer_view, shape);
+	Transition(command, inputs.hudless_backbuffer, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	const vk::ClearColorValue       black {std::array<float, 4> {0.0f, 0.0f, 0.0f, 1.0f}};
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	command.clearColorImage(inputs.hudless_backbuffer.image, vk::ImageLayout::eTransferDstOptimal, &black, 1, &range);
+	Transition(command, inputs.hudless_backbuffer, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	Transition(command, inputs.hudless, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+	           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+	// The same scaling as the presented image's (Swapchain::RecordPresentCommands).
+	vk::ImageBlit blit {};
+	blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(inputs.hudless.extent.width),
+                                       static_cast<int32_t>(inputs.hudless.extent.height), 1};
+	blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	blit.dstOffsets[0]  = vk::Offset3D {region.offset.x, region.offset.y, 0};
+	blit.dstOffsets[1]  = vk::Offset3D {region.offset.x + static_cast<int32_t>(region.extent.width),
+                                       region.offset.y + static_cast<int32_t>(region.extent.height), 1};
+	if (region.extent.width == 0 || region.extent.height == 0) {
+		blit.dstOffsets[0] = vk::Offset3D {0, 0, 0};
+		blit.dstOffsets[1] = vk::Offset3D {static_cast<int32_t>(backbuffer.width), static_cast<int32_t>(backbuffer.height), 1};
+	}
+	command.blitImage(inputs.hudless.image, vk::ImageLayout::eTransferSrcOptimal, inputs.hudless_backbuffer.image,
+	                  vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+	Transition(command, inputs.hudless_backbuffer, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	inputs.hudless_backbuffer_valid = true;
+}
+
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs) {
 	inputs.valid = false;
 	const bool ready = g_sources.valid && g_camera.valid;
-	const auto sources = g_sources;
-	const auto camera  = g_camera;
-	g_sources.valid    = false;
-	g_camera.valid     = false;
+	const auto sources       = g_sources;
+	const auto camera        = g_camera;
+	const bool hudless_ready = g_hudless_ready;
+	g_sources.valid          = false;
+	g_camera.valid           = false;
+	g_hudless_ready          = false;
 	++g_guest_frame;
+	if (!g_ready && !g_external) return; // (the camera alone: FSR 4 upscaling)
 	if (!ready) {
 		return;
 	}
@@ -849,6 +970,16 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	if (inputs.motion_attachment) {
 		ZeroStaticRect(vk_command, inputs.motion, inputs.motion_view);
 	}
+	inputs.hudless_valid = false;
+	if (hudless_ready) {
+		Configure(graphics, inputs.hudless, inputs.hudless_view, g_hudless, nullptr, vk::ImageUsageFlagBits::eTransferSrc);
+		Transition(vk_command, inputs.hudless, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+		CopyWhole(vk_command, g_hudless.image, vk::ImageLayout::eTransferSrcOptimal, inputs.hudless);
+		Transition(vk_command, inputs.hudless, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+		           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+		inputs.hudless_valid = true;
+	}
 	inputs.render_extent = {motion.backing.extent.width, motion.backing.extent.height};
 	inputs.camera        = camera;
 	inputs.guest_frame   = g_guest_frame;
@@ -856,18 +987,20 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 }
 
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
-	for (auto* view: {&inputs.depth_view, &inputs.motion_view}) {
+	for (auto* view: {&inputs.depth_view, &inputs.motion_view, &inputs.hudless_view, &inputs.hudless_backbuffer_view}) {
 		if (*view != nullptr) {
 			graphics.device.destroyImageView(*view, nullptr);
 			*view = nullptr;
 		}
 	}
-	for (auto* image: {&inputs.depth, &inputs.motion}) {
+	for (auto* image: {&inputs.depth, &inputs.motion, &inputs.hudless, &inputs.hudless_backbuffer}) {
 		if (image->image != nullptr) {
 			graphics.DeleteImage(*image);
 		}
 	}
-	inputs.valid = false;
+	inputs.valid                    = false;
+	inputs.hudless_valid            = false;
+	inputs.hudless_backbuffer_valid = false;
 }
 
 } // namespace Libs::Graphics::FrameGen

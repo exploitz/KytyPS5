@@ -117,7 +117,7 @@ def generate(registry, header):
             args.append('copied_' + n)
         names.append(name)
         mark_id = MARK_IDS.get(name[:-3] if name.endswith('KHR') else name)
-        mark = (f'LiveTrace::VulkanMark(commandBuffer, {mark_id}, {"true" if mark_id < 10 else "false"}); '
+        mark = (f'LiveTrace::VulkanMark(commandBuffer, {mark_id}, {"true" if mark_id < 10 else "false"}, KYTY_RETURN_ADDRESS()); '
                 if mark_id is not None and ret == 'void' else '')
         declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({", ".join(decl(p) for p in params)}) {{')
         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.

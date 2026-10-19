@@ -1,12 +1,17 @@
 #include "libs/imeDialog.h"
 
 #include "libs/errno.h"
+#include "common/stringUtils.h"
+#include "libs/controller.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace Libs::Dialog::ImeDialog {
@@ -271,6 +276,99 @@ bool MatchRunningGeneration(uint64_t generation) {
 	return g_state.status == Status::Running && g_state.generation == generation;
 }
 
+// The input tape's side file, <tape>.ime: one line per dialog the game ran, "<end status>\t<text as UTF-8>" (the
+// pad tape holds no typed text: a replay of a new game stopped at the character's name). Recorded when the game takes
+// the result; replayed by typing the line and accepting (or cancelling) as soon as the dialog opens.
+std::u16string Utf8ToUtf16(std::string_view text) {
+	std::u16string out;
+	for (size_t i = 0; i < text.size();) {
+		const auto c = static_cast<unsigned char>(text[i]);
+		uint32_t   code = c;
+		size_t     more = 0;
+		if (c >= 0xF0) {
+			code = c & 0x07u;
+			more = 3;
+		} else if (c >= 0xE0) {
+			code = c & 0x0Fu;
+			more = 2;
+		} else if (c >= 0xC0) {
+			code = c & 0x1Fu;
+			more = 1;
+		}
+		i++;
+		for (; more > 0 && i < text.size(); more--, i++) code = (code << 6u) | (static_cast<unsigned char>(text[i]) & 0x3Fu);
+		if (code >= 0x10000) {
+			code -= 0x10000;
+			out.push_back(static_cast<char16_t>(0xD800 + (code >> 10u)));
+			out.push_back(static_cast<char16_t>(0xDC00 + (code & 0x3FFu)));
+		} else {
+			out.push_back(static_cast<char16_t>(code));
+		}
+	}
+	return out;
+}
+
+// g_mutex held: the finished dialog's text and end status appended to the recording's side file.
+void TapeNoteResult() {
+	static uint64_t noted_generation = 0; // (the game may ask for the result more than once)
+	if (g_state.generation == noted_generation) return;
+	const auto tape = Controller::RecordingTapePath();
+	if (tape.empty()) return;
+	noted_generation = g_state.generation;
+	const auto& text = g_state.end_status == EndStatus::Ok ? g_state.editor.GetText() : g_state.original_text;
+	std::ofstream file(tape + ".ime", std::ios::app);
+	file << static_cast<int>(g_state.end_status) << '\t' << Common::Utf16ToUtf8(text) << '\n';
+	Controller::NoteMarker("dialog");
+}
+
+// A dialog opened during a replay: once the game polls it (ImeDialogGetStatus: typed at Init, the game reopened the
+// dialog and the ghost stood at the name entry), the next recorded line is typed and the dialog ended the way it was; a
+// dialog past the recorded lines types the last line again (a name asked twice).
+uint64_t g_tape_pending_generation = 0;
+
+void TapeApplyPending() {
+	uint64_t generation = 0;
+	{
+		std::scoped_lock lock(g_mutex);
+		if (g_tape_pending_generation == 0 || !MatchRunningGeneration(g_tape_pending_generation)) return;
+		generation                 = g_tape_pending_generation;
+		g_tape_pending_generation = 0;
+	}
+	const auto tape = Controller::ReplayTapePath();
+	if (tape.empty()) return;
+	static std::vector<std::string> lines;
+	static size_t                   next   = 0;
+	static bool                     loaded = false;
+	if (!loaded) {
+		loaded = true;
+		std::ifstream file(tape + ".ime");
+		for (std::string line; std::getline(file, line);) {
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			lines.push_back(line);
+		}
+		std::printf("Input replay: %zu dialog line(s) in %s.ime\n", lines.size(), tape.c_str());
+	}
+	if (lines.empty()) {
+		std::printf("Input replay: a dialog opened with no recorded line (the live keyboard takes it)\n");
+		std::fflush(stdout);
+		return;
+	}
+	const auto& line = lines[std::min(next, lines.size() - 1)];
+	next++;
+	const auto  tab  = line.find('\t');
+	const int   end_status = std::atoi(line.c_str());
+	const auto  text = tab != std::string::npos ? line.substr(tab + 1) : std::string();
+	std::printf("Input replay: dialog %zu: '%s' (end status %d)\n", next, text.c_str(), end_status);
+	std::fflush(stdout);
+	if (end_status == static_cast<int>(EndStatus::Ok)) {
+		if (!text.empty()) HostInsertText(generation, Utf8ToUtf16(text));
+		HostAccept(generation);
+	} else {
+		HostCancel(generation);
+	}
+	Controller::NoteMarker("dialog"); // (the tape moves to the moment the recording's dialog was answered)
+}
+
 bool FinishFromHost(uint64_t generation, EndStatus end_status) {
 	uint64_t notify_generation = 0;
 	{
@@ -409,10 +507,15 @@ int KYTY_SYSV_ABI ImeDialogInit(const Param* param, const ExtendedParam* extende
 		g_revision.store(g_state.revision, std::memory_order_release);
 	}
 	NotifyVisibility(true, generation);
+	if (!Controller::ReplayTapePath().empty()) {
+		std::scoped_lock lock(g_mutex);
+		g_tape_pending_generation = generation;
+	}
 	return OK;
 }
 
 int KYTY_SYSV_ABI ImeDialogGetStatus() {
+	TapeApplyPending();
 	ApplyExternalInputs();
 	ApplyFilterAndCommit();
 	return static_cast<int>(g_status.load(std::memory_order_acquire));
@@ -465,6 +568,7 @@ int KYTY_SYSV_ABI ImeDialogGetResult(Result* result) {
 		return ERROR_NOT_FINISHED;
 	}
 	result->endstatus = g_state.end_status;
+	TapeNoteResult();
 	return OK;
 }
 

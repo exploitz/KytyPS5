@@ -28,6 +28,7 @@
 #include "libs/errno.h"
 #include "frame-capture.h"
 #include "frame-gen.h"
+#include "fsr4-upscale.h"
 #include "native-preparation-state.h"
 #include "live-counters.h"
 
@@ -1078,6 +1079,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                    program.shader_hash, thread_group_x, thread_group_y, thread_group_z);
 		DeviceFault::NoteDispatch(m_context.GetCommandScheduler().CurrentTick(), program.shader_hash, thread_group_x,
 		                          thread_group_y, thread_group_z, 0);
+		// KYTY_FSR4: FSR 4's colour into the TAA pass's output (fsr4-upscale.h).
+		if (Fsr4Upscale::Active() && FrameGen::IsTaaShader(program.shader_hash))
+			Fsr4Upscale::Record(m_context.GetGraphics(), m_context.GetTextureCache(), m_context.GetCommandScheduler(), vk_buffer,
+			                    bindings);
 	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.

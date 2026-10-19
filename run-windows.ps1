@@ -27,6 +27,15 @@
 #   .\run-windows.ps1 -Aspect 21:9           Demon's Souls renders its 3D wider (21:9 = 64:27, up to 32:9; 3416x1440
 #                                            at 21:9), seeing more to the sides; shown at that aspect (the HUD at
 #                                            its sides unstretched, in-game menus stretched), movies at 16:9
+#   .\run-windows.ps1 -Quality low            Demon's Souls draws less (shadows: no ambient or spot-light shadows,
+#                                            sun shadows to 60 m; low / lowest: also simpler shadows and distant
+#                                            detail): faster where the CPU limits
+#   .\run-windows.ps1 -Output 1080q           Demon's Souls' picture: 4k (its 1440p scene, 3840x2160 output: the
+#                                            default), 1080q (the 1440p scene scaled down to a 1920x1080 output)
+#                                            or 1080f (a 1080p scene); the 1080p ones keep the HUD at its size
+#                                            (game code patches in patches\)
+#   .\run-windows.ps1 -Upscaler fsr4          FSR 4 instead of the game's TAA (experimental; deps\fsr4)
+#   .\run-windows.ps1 -FsrFrameGen            FSR 3.1 frame generation (deps\fsr\amd_fidelityfx_vk.dll)
 #   .\run-windows.ps1 -Quality low            Demon's Souls draws less (low / lowest: simpler shadows and
 #                                            distant detail): faster where the CPU limits
 #   .\run-windows.ps1 -TextureReduce 1       large textures without their largest level: half the size per side
@@ -65,6 +74,9 @@ param(
 	[int]$RenderHeight = 0,
 	[string]$Aspect = '',
 	[string]$Quality = '',
+	[string]$Output = '',
+	[string]$Upscaler = '',
+	[switch]$FsrFrameGen,
 	[string]$TextureReduce = '',
 	[string[]]$Set = @(),
 	[string]$Patch = '',
@@ -317,16 +329,47 @@ if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Asp
 # ambient shadowing, no shadows from torches and other spot lights. A laptop Ryzen 9 5900HX + RTX 3080 standing, same
 # process (standard -> low / lowest): Boletaria 1-1 20.0 -> 22.6 / 24.0 fps, Latria 22.6 -> 25.5 / 25.8, Shrine of
 # Storms 25.0 -> 26.6 / 29.0; with -RenderHeight 1080 Latria 25.4 -> 27.8 / 28.8, the Shrine 30.7 -> 34.9 / 35.8.
+# shadows: the shadows alone (no ambient shadowing, no spot-light shadows, sun shadows to 60 m), the scenery as in
+# standard: an i9-12900K + RTX 3080 Ti standing, Boletaria 1-1 +12%, Tower of Latria +15%, the Nexus +17%. (low and
+# lowest's r_forceShadowLOD also drops foreground objects: 1-1's dead trees and cart, the Nexus's glowing runes.)
 $qualityConvars = @{
+	shadows = 'sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
 	low    = 'r_forceShadowLOD=true;r_forceViewportHeightForPixelSizeCalc=720;sunShadowMaxDistance=125'
 	lowest = 'r_forceShadowLOD=true;r_forceViewportHeightForPixelSizeCalc=480;sunShadowMaxDistance=60;r_enableAmbientShadowing=false;r_enableSpotShadows=false'
 }
 if ($Quality -and $Quality -ne 'standard') {
-	if (!$qualityConvars.Contains($Quality)) { throw "-Quality takes low or lowest (or standard), not '$Quality'" }
+	if (!$qualityConvars.Contains($Quality)) { throw "-Quality takes shadows, low or lowest (or standard), not '$Quality'" }
 	if ($titleId -match '^PPSA0134[0-2]$') {
 		$environment['KYTY_GAME_CONVARS'] = (@($environment['KYTY_GAME_CONVARS'], $qualityConvars[$Quality]) | Where-Object { $_ }) -join ';'
 	}
 }
+# -Output: Demon's Souls' output tier (its graphics-mode files, KYTY_RENDER_CONVARS) and, for 1080p, game code patches
+# that keep the HUD at its size (patches\, applied where their original bytes are found). 1080q also renders the
+# 1440p scene of the PS5 mode and scales it down (sharper than 1080f's 1080p scene, ~3% slower).
+$outputs = @{
+	'4k'  = @{ Convars = ''; Patch = '' }
+	'1080q' = @{ Convars = 'r_Wants4K=WantsPerf'; Patch = 'patches\1080p-quality.json' }
+	'1080f' = @{ Convars = 'r_Wants4K=WantsBase'; Patch = 'patches\1080p-fast.json' }
+}
+if ($Output) {
+	if (!$outputs.Contains($Output)) { throw "-Output takes 4k, 1080q or 1080f, not '$Output'" }
+	if ($titleId -match '^PPSA0134[0-2]$' -and $outputs[$Output].Convars) {
+		$environment['KYTY_RENDER_CONVARS'] = $outputs[$Output].Convars
+		$file = Join-Path $PSScriptRoot $outputs[$Output].Patch
+		if (!$Patch -and (Test-Path $file)) { Set-Option '--game-patch' $file }
+	}
+}
+# -Upscaler fsr4: FSR 4 (an experimental source-v07 build, its model files in deps\fsr4) instead of the game's TAA, at
+# the same resolution: cleaner edges, ~13% slower (RTX 3080 Ti, 1440p scene).
+if ($Upscaler) {
+	if ($Upscaler -ne 'fsr4' -and $Upscaler -ne 'taa') { throw "-Upscaler takes taa or fsr4, not '$Upscaler'" }
+	if ($Upscaler -eq 'fsr4') { $environment['KYTY_FSR4'] = '1' }
+}
+# -FsrFrameGen: FSR 3.1 frame generation (AMD FidelityFX, any GPU): a generated frame between two of the game's; the HUD
+# stays out of the generated ones. Video memory is kept for its buffers.
+if ($FsrFrameGen) {
+	$environment['KYTY_FRAMEGEN_FSR'] = '1'
+	if (!$environment.Contains('KYTY_VRAM_RESERVE_MB')) { $environment['KYTY_VRAM_RESERVE_MB'] = '512' }
 # -TextureReduce 0|1|2: large block-compressed textures held without their 1 or 2 largest levels (KYTY_TEXTURE_REDUCE;
 # without it the emulator takes 1 below 12 GB of video memory, else 0). A simulated 8 GB card at Boletaria 1-1: textures
 # 4.1 -> 2.8 GiB, 1% low 37-49 -> 53-58 fps; close surfaces a little softer.
@@ -358,6 +401,9 @@ if ($Precompile) {
 	# unoptimized build at once, the optimized one in the background) and cached from then on.
 	if (!$environment.Contains('KYTY_SHADER_WARMUP_SECONDS')) { $environment['KYTY_SHADER_WARMUP_SECONDS'] = '60' }
 }
+# The start-up warmup's threads: 'auto' (the release config) leaves two of the launch's CPUs to the game and the
+# system, at most 16 (a fixed 16 oversubscribed 4- and 6-core CPUs for the warmup's minute).
+if ($environment['KYTY_SHADER_WARMUP_THREADS'] -eq 'auto') { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$([math]::Max(1, [math]::Min(16, $cpus - 2)))" }
 if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 # Stutters in the log: frames, shader translations and pipeline creations of 100 ms or more (SLOW lines;
 # what runs per frame or on a cache miss only, so nothing measurable).

@@ -125,7 +125,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                       decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
 	memory.image_r128    = decoded.image_r128;
-	memory.image_cube    = decoded.image_cube;
 	memory.glc           = decoded.glc;
 	memory.slc           = decoded.slc;
 	memory.idxen         = decoded.idxen;

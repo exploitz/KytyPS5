@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <map>
+#include <string>
 #include <mutex>
 #include <tuple>
 #include <vector>
@@ -89,6 +90,7 @@ struct GraphicContext {
 	Common::Mutex                      present_queue_mutex;
 	vk::Queue                          present_queue = nullptr;
 	bool                               present_queue_created = false; // queue index 1 of queue_family
+	bool                               fsr_queues_created    = false; // indices 2..4: FsrFrameGen
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -162,11 +164,17 @@ struct GraphicContext {
 	// A log line on where the video memory goes (Windows' and VMA's figures): diagnostics.
 	void                   LogVideoMemory(const char* label) const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// The device-local heaps' budget as the system reports it (no margins; GetTotalMemoryBudget is what the caches use).
+	[[nodiscard]] uint64_t GetDeviceMemoryBudget() const;
+	// `host_memory`: in system memory (host-visible), not video memory (TextureCache::DemoteImage); the pool not used.
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image, bool host_memory = false);
 	void                   DeleteImage(VulkanImage& image);
 	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
 	void                   TrimImagePool();
 	void                   ReportMemoryFallback(const char* what, uint64_t bytes) const;
+	// One line of the video memory inventory (the allocator's view: the device heap's usage and
+	// budget, allocations by device-local and host memory, the image pool), for the file log.
+	[[nodiscard]] std::string VideoMemoryLine() const;
 	// KYTY_SIMULATE_VRAM_MB: the video memory taken at start-up (left out of the budget and usage above).
 	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video
 	// memory to render targets and buffers (CreateImage); the pipeline warmup leaves its pipelines to first use.
@@ -174,6 +182,13 @@ struct GraphicContext {
 	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
 	// (MemoryUsage::SparseDeviceLocal).
 	bool                          sparse_residency_buffers = false;
+	// KYTY_BDA_SPARSE_BIND=own (an A/B of our 10-07 page table against his): its binds on a queue of their own
+	// (Buffer::MakeResident); null: on the graphics queue.
+	uint32_t                      sparse_queue_index = 0;
+	vk::Queue                     sparse_queue       = nullptr;
+	// VK_EXT_zero_initialize_device_memory (with KYTY_BDA_SPARSE=1; KYTY_BDA_SPARSE_ZERO=0 off): the sparse page
+	// table's new pages come zeroed from the driver, so no submission can read them before Buffer::MakeResident's fill.
+	bool                          zero_initialize_memory = false;
 	// An image only sampled and copied (CreateImage places these apart on such a GPU).
 	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
 		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |
@@ -207,6 +222,7 @@ struct VulkanImageState {
 };
 
 struct VulkanImage {
+	bool host_memory = false; // its memory is host-visible system memory (CreateImage with host_memory)
 	VulkanImage() = default;
 	KYTY_CLASS_NO_COPY(VulkanImage);
 

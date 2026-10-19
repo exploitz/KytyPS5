@@ -51,20 +51,30 @@ public:
 		m_free.push_back(id);
 	}
 
+	// The objects last used at `tick` or before, the oldest first; `function` takes the object, or the object and its
+	// tick, and may return true to stop.
 	template <typename Function>
 	void ForEachItemBelow(Tick tick, Function&& function) {
-		constexpr bool ReturnsBool = std::is_same_v<std::invoke_result_t<Function, Object>, bool>;
+		constexpr bool WithTick = std::is_invocable_v<Function, Object, Tick>;
+		const auto     call     = [&](Item& item) {
+			if constexpr (WithTick) {
+				return function(item.object, item.tick);
+			} else {
+				return function(item.object);
+			}
+		};
+		constexpr bool ReturnsBool = std::is_same_v<decltype(call(std::declval<Item&>())), bool>;
 		for (auto* item = m_first; item != nullptr;) {
 			if (item->tick > tick) {
 				return;
 			}
 			auto* next = item->next;
 			if constexpr (ReturnsBool) {
-				if (function(item->object)) {
+				if (call(*item)) {
 					return;
 				}
 			} else {
-				function(item->object);
+				call(*item);
 			}
 			item = next;
 		}

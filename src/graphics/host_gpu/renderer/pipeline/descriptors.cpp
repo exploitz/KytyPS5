@@ -569,7 +569,8 @@ static bool TexturePrefixEnabled(bool small_video_memory) {
 	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
 }
 
-// KYTY_TEXTURE_REDUCE=0|1|2 (default: 1 with less than 12 GiB of video memory, else 0): a sampled 2D block-compressed
+// KYTY_TEXTURE_REDUCE=0|1|2 (default 0: never on its own, the launcher's Graphics Low / Lowest pass 1 / 2; chen's default
+// is 1 with less than 12 GiB of video memory, a fidelity loss this fork keeps opt-in): a sampled 2D block-compressed
 // texture of at least 1024 texels on a side is held without its 1 or 2 largest levels, as a T# from that level would be
 // (TextureFromLevel): its kept levels are the first bytes of its memory, so the left-out ones take no video memory and
 // are not uploaded when the game writes them. One level left out is a quarter of the texture: at 1-1 its BC textures
@@ -580,7 +581,8 @@ static uint32_t TextureReduceLevels(bool small_video_memory) {
 		const char*    value  = std::getenv("KYTY_TEXTURE_REDUCE");
 		const uint32_t chosen = value != nullptr && value[0] != '\0'
 		                            ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2))
-		                            : (small_video_memory ? 1u : 0u);
+		                            : 0u;
+		(void)small_video_memory;
 		if (chosen != 0) {
 			std::printf("Textures: large block-compressed textures held without their %u largest level(s) "
 			            "(KYTY_TEXTURE_REDUCE=0 keeps them whole)\n",
@@ -688,6 +690,19 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
+	// Probe (upstream f38d738e honours it): a texture whose minimum LOD (U4.8) lies past its base level
+	// is a streamed mip chain whose finer levels the game has not loaded yet; this emulator samples them.
+	if (!storage && descriptor.MinLod() > descriptor.BaseLevel() * 256u) {
+		static std::atomic<uint64_t> seen {0};
+		const uint64_t               n = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 8 || n == 100 || n == 1000 || n == 10000 || n == 100000 || n == 1000000) {
+			std::printf("TextureMinLod: view %" PRIu64 ": min_lod %.2f (warn %.2f, mip stats %d/%u), levels %u-%u, %ux%u, format %u\n",
+			            n, static_cast<double>(descriptor.MinLod()) / 256.0, static_cast<double>(descriptor.MinLodWarn5()) / 256.0,
+			            descriptor.MipStatsCntEn() ? 1 : 0, descriptor.MipStatsCntId(), descriptor.BaseLevel(), descriptor.LastLevel(),
+			            descriptor.Width5() + 1u, descriptor.Height5() + 1u, static_cast<uint32_t>(descriptor.Format()));
+			std::fflush(stdout);
+		}
+	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
 	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
@@ -1300,6 +1315,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	// cannot keep as one image take each other's away for ever (the Shrine, 10-05): past half the passes, an
 	// image that still does not hold is bound as a null image.
 	for (uint32_t attempt = 0;; ++attempt) {
+		EXIT_IF(attempt == 64);
 		for (uint32_t pass = 0; !std::ranges::all_of(images, acquirable); ++pass) {
 			if (pass + attempt == 16) EXIT("RebindImages: the images of a binding do not settle\n");
 			const bool null = pass + attempt >= 8;

@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "async-upload.h"
+#include "causal-probe.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #include "device-fault.h"
@@ -23,6 +24,11 @@ extern "C" {
 volatile std::atomic_uint32_t kyty_local_dispatch_batch {32};
 // Draws recorded per submission (KYTY_DRAW_BATCH, 0: no limit): about 0.5 ms of translated draws.
 volatile std::atomic_uint32_t kyty_local_draw_batch {256};
+// KYTY_DRAW_BATCH_IDLE (0: off): while the GPU has run dry, the draws recorded so far go out every N draws short of the
+// batch. After the game's mid-frame readback wait (1-1 at 4K: its threads wait ~8.5 ms for the GPU's backlog, the
+// render thread idles 5 ms, then the rest of the frame is submitted) the GPU idled ~1.4 ms a frame until the first 256
+// draws of the rest were translated.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_draw_batch_idle {0};
 // Buffer uploads of pages dirty since before the open command buffer began go into its upload prologue
 // (CommandScheduler::UploadPrologue).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_upload_prologue {1};
@@ -223,15 +229,25 @@ void CommandScheduler::CompleteDispatch() {
 // translated. Whole, the GPU idled through its translation (3-4.5 ms for the big passes) and ran it after, late into the
 // next frame, where the next frame's culling readbacks waited for it.
 void CommandScheduler::CompleteDraws(uint32_t draws) {
+	CausalProbe::At(CausalProbe::Draw, draws);
 	const auto batch = kyty_local_draw_batch.load(std::memory_order_relaxed);
-	if (t_recorder != nullptr || batch == 0 || (m_recorded_draws += draws) < batch) {
+	if (t_recorder != nullptr || batch == 0) {
 		return;
 	}
-	// As CompleteDispatch's: on while the GPU is busy (asked at the batch's end and about every 16 draws after it), up
-	// to 8 batches.
-	const bool end = m_recorded_draws - draws < batch;
-	if (m_recorded_draws < 8 * batch && ((!end && (m_recorded_draws & 15u) >= draws && draws < 16) || GpuBusy())) {
-		return;
+	m_recorded_draws += draws;
+	if (m_recorded_draws < batch) {
+		// KYTY_DRAW_BATCH_IDLE: from that many draws on, asked about every 16, the part goes out while the GPU idles.
+		const auto idle = kyty_local_draw_batch_idle.load(std::memory_order_relaxed);
+		if (idle == 0 || m_recorded_draws < idle || ((m_recorded_draws & 15u) >= draws && draws < 16) || GpuBusy()) {
+			return;
+		}
+	} else {
+		// As CompleteDispatch's: on while the GPU is busy (asked at the batch's end and about every 16 draws after it),
+		// up to 8 batches.
+		const bool end = m_recorded_draws - draws < batch;
+		if (m_recorded_draws < 8 * batch && ((!end && (m_recorded_draws & 15u) >= draws && draws < 16) || GpuBusy())) {
+			return;
+		}
 	}
 	CheckActive();
 	m_command.EndRendering();

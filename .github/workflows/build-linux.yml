@@ -1,12 +1,10 @@
 name: Build KytyPS5 (Linux)
 
-# This fork's Linux build (Demon's Souls, see README.md), like the Windows one (.github/workflows/build.yml): a
-# pushed v* tag builds the Linux package and adds it to that tag's release; a manual run (Actions > Build KytyPS5
-# (Linux) > Run workflow) publishes it as a release of its own, not marked latest (README.md links to the latest
-# release, the Windows package's). Pushes build nothing.
+# chen's Linux build (Demon's Souls). This fork's releases are Windows only for now (tools/release; Linux is
+# planned), so a pushed tag starts nothing here: a v* tag ran it for v1.0.0-beta.1 and would have added an untested
+# Linux package to the Windows release. A manual run (Actions > Build KytyPS5 (Linux) > Run workflow) still builds
+# and publishes it as a release of its own, not marked latest. Pushes build nothing.
 on:
-  push:
-    tags: [ 'v*' ]
   workflow_dispatch:
 
 concurrency:

@@ -67,7 +67,6 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
-	bool                    image_cube                                            = false;
 	bool                    glc                                                   = false;
 	bool                    slc                                                   = false;
 	bool                    idxen                                                 = false;

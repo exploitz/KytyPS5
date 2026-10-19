@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecDemand.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -6142,6 +6143,278 @@ void TestPixelAncillaryLayerInput() {
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },
               "direct raw ancillary export was silently replaced after field lowering");
 #endif
+}
+
+void TestExecDemandSelects() {
+  using namespace ShaderRecompiler::IR;
+  // Each case selects 10 (true operand) or 20 (false operand) under the lane mask m in the entry
+  // and passes the result through lane-local arithmetic to one kind of use in the join.
+  enum class Result { TrueOperand, FalseOperand, Kept };
+  enum class Use {
+    Guarded, Conjunction, Disjunction, Negated, Implied, TrueArm, Unguarded, OtherGuard,
+    Predicate, Mixed, Store, OtherStore, ReadFirstLane, OtherFirstLane, ReadLane, Branch,
+    DppActive, DppFetchInactive, ExplicitLod, ImplicitLod, ComputeSample, Widened, Unshared,
+    Phi, Dispatcher
+  };
+  struct Case {
+    Use use;
+    Result result;
+  };
+  constexpr Case cases[] = {
+      {Use::Guarded, Result::TrueOperand},
+      {Use::Conjunction, Result::TrueOperand},     // m and another mask
+      {Use::Disjunction, Result::TrueOperand},     // (m and other) or m: an S_OR_B64 restore
+      {Use::Negated, Result::FalseOperand},        // other and not m: the else lanes
+      {Use::Implied, Result::TrueOperand},         // other and not (other and not m)
+      {Use::TrueArm, Result::TrueOperand},         // Select(m, value, 0) exported everywhere
+      {Use::Unguarded, Result::Kept},
+      {Use::OtherGuard, Result::Kept},
+      {Use::Predicate, Result::Kept},              // the value decides an export mask
+      {Use::Mixed, Result::Kept},
+      {Use::Store, Result::TrueOperand},           // LDS write under m
+      {Use::OtherStore, Result::Kept},
+      {Use::ReadFirstLane, Result::TrueOperand},   // reads a lane of m
+      {Use::OtherFirstLane, Result::Kept},
+      {Use::ReadLane, Result::Kept},               // reads a lane whatever EXEC holds
+      {Use::Branch, Result::Kept},
+      {Use::DppActive, Result::TrueOperand},       // inactive source lanes read as zero
+      {Use::DppFetchInactive, Result::Kept},
+      {Use::ExplicitLod, Result::TrueOperand},
+      {Use::ImplicitLod, Result::Kept},            // pixel derivatives read the quad
+      {Use::ComputeSample, Result::TrueOperand},   // sampled at an explicit LOD outside pixel
+      {Use::Widened, Result::TrueOperand},         // ten terms widen to the shared m
+      {Use::Unshared, Result::Kept},               // ten terms, one without m
+      {Use::Phi, Result::TrueOperand},
+      {Use::Dispatcher, Result::Kept},             // unstructured programs are left alone
+  };
+  for (const auto &item : cases) {
+    Program program;
+    program.stage = item.use == Use::ComputeSample ? ShaderType::Compute : ShaderType::Pixel;
+    program.dispatcher_fallback = item.use == Use::Dispatcher;
+    for (uint32_t i = 0; i < 4; ++i) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+    }
+    auto &entry = *program.blocks[0];
+    auto &join = *program.blocks[3];
+    entry.AddBranch(program.blocks[1]);
+    entry.AddBranch(program.blocks[2]);
+    program.blocks[1]->AddBranch(&join);
+    program.blocks[2]->AddBranch(&join);
+    const auto mask_from = [&](uint32_t reg) {
+      const auto input = Value(&entry.AppendNewInst(ValueOpcode::GetUserData,
+                                                   {Value(static_cast<ScalarReg>(reg))}));
+      return Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {input, Value(0u)}));
+    };
+    const auto m = mask_from(0);
+    const auto other = mask_from(1);
+    auto &masked = entry.AppendNewInst(ValueOpcode::SelectU32, {m, Value(10u), Value(20u)});
+    Value value(&masked);
+    if (item.use == Use::Phi) {
+      auto &phi = join.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+      phi.AddPhiOperand(program.blocks[1], value);
+      phi.AddPhiOperand(program.blocks[2], Value(0u));
+      value = Value(&phi);
+    }
+    value = Value(&join.AppendNewInst(ValueOpcode::BitCastF32U32, {value}));
+    value = Value(&join.AppendNewInst(ValueOpcode::FPMul32, {value, Value::F32(2.f)}));
+    value = Value(&join.AppendNewInst(ValueOpcode::BitCastU32F32, {value}));
+    const auto conjunction = [&](Value lhs, Value rhs) {
+      return Value(&join.AppendNewInst(ValueOpcode::LogicalAnd, {lhs, rhs}));
+    };
+    const auto negation = [&](Value operand) {
+      return Value(&join.AppendNewInst(ValueOpcode::LogicalNot, {operand}));
+    };
+    const auto export_under = [&](Value exported, Value guard) {
+      const auto packed = Value(&join.AppendNewInst(
+          ValueOpcode::CompositeConstructU32x4, {exported, Value(0u), Value(0u), Value(0u)}));
+      join.AppendNewInst(ValueOpcode::SetAttribute, {packed, guard});
+    };
+    switch (item.use) {
+    case Use::Guarded:
+    case Use::Phi:
+    case Use::Dispatcher:
+      export_under(value, m);
+      break;
+    case Use::Conjunction:
+      export_under(value, conjunction(other, m));
+      break;
+    case Use::Disjunction:
+      export_under(value, Value(&join.AppendNewInst(ValueOpcode::LogicalOr,
+                                                    {conjunction(m, other), m})));
+      break;
+    case Use::Negated:
+      export_under(value, conjunction(other, negation(m)));
+      break;
+    case Use::Implied:
+      export_under(value, conjunction(other, negation(conjunction(other, negation(m)))));
+      break;
+    case Use::TrueArm:
+      export_under(Value(&join.AppendNewInst(ValueOpcode::SelectU32, {m, value, Value(0u)})),
+                   Value(true));
+      break;
+    case Use::Unguarded:
+      export_under(value, Value(true));
+      break;
+    case Use::OtherGuard:
+      export_under(value, other);
+      break;
+    case Use::Predicate:
+      export_under(Value(0u),
+                   Value(&join.AppendNewInst(ValueOpcode::INotEqual32, {value, Value(0u)})));
+      break;
+    case Use::Mixed:
+      export_under(value, m);
+      export_under(value, Value(true));
+      break;
+    case Use::Store:
+    case Use::OtherStore:
+      join.AppendNewInst(ValueOpcode::WriteSharedU32,
+                         {Value(0u), value, item.use == Use::Store ? m : other});
+      break;
+    case Use::ReadFirstLane:
+    case Use::OtherFirstLane:
+      export_under(Value(&join.AppendNewInst(ValueOpcode::ReadFirstLane,
+                                             {value, item.use == Use::ReadFirstLane ? m : other})),
+                   Value(true));
+      break;
+    case Use::ReadLane:
+      export_under(Value(&join.AppendNewInst(ValueOpcode::ReadLane, {value, Value(0u)})), m);
+      break;
+    case Use::Branch:
+      join.AppendNewInst(ValueOpcode::Reference,
+                         {Value(&join.AppendNewInst(ValueOpcode::INotEqual32, {value, Value(0u)}))});
+      break;
+    case Use::DppActive:
+    case Use::DppFetchInactive: {
+      auto &move = join.AppendNewInst(ValueOpcode::DppMoveU32, {value, m});
+      move.SetFlags(DppMoveFlags{.control = 0x161, // row_xmask:1
+                                 .fetch_inactive = item.use == Use::DppFetchInactive});
+      export_under(Value(&move), m);
+      break;
+    }
+    case Use::ExplicitLod:
+    case Use::ImplicitLod:
+    case Use::ComputeSample: {
+      const auto zero = Value(0u);
+      auto &address = join.AppendNewInst(ValueOpcode::MakeImageAddress,
+          {value, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero});
+      auto &image = entry.AppendNewInst(ValueOpcode::GetImageResource,
+          {zero, zero, zero, zero, zero, zero, zero, zero});
+      auto &sampler = entry.AppendNewInst(ValueOpcode::GetSamplerResource,
+          {zero, zero, zero, zero});
+      program.memory_info.emplace_back().image_sample_flags =
+          item.use == Use::ExplicitLod ? ShaderRecompiler::Decoder::ImageSampleFlagLod : 0u;
+      auto &sample = join.AppendNewInst(ValueOpcode::ImageSampleRaw,
+                                        {Value(&image), Value(&sampler), Value(&address)});
+      export_under(Value(&join.AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                             {Value(&sample), zero})),
+                   m);
+      break;
+    }
+    case Use::Widened:
+    case Use::Unshared:
+      for (uint32_t index = 0; index < 10; ++index) {
+        const auto extra = mask_from(2 + index);
+        export_under(value, item.use == Use::Unshared && index == 9 ? extra
+                                                                    : conjunction(m, extra));
+      }
+      break;
+    }
+    const auto stats = EliminateMaskedSelects(program);
+    const auto resolved = Value(&masked).Resolve();
+    const auto actual = resolved == Value(10u)   ? Result::TrueOperand
+                        : resolved == Value(20u) ? Result::FalseOperand
+                                                 : Result::Kept;
+    const auto text = "exec demand case " + std::to_string(static_cast<int>(item.use)) +
+                      " misjudged the lanes that observe a masked value";
+    Check(actual == item.result && (actual == Result::Kept || stats.selects_removed != 0),
+          text.c_str());
+  }
+
+  // A loop-carried select: its old value reaches the next iteration through the header Phi,
+  // which reads it under m. Only an m defined before the loop names the same lanes there.
+  for (const bool invariant : {true, false}) {
+    Program program;
+    for (uint32_t i = 0; i < 4; ++i) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+    }
+    auto &pre = *program.blocks[0];
+    auto &header = *program.blocks[1];
+    auto &latch = *program.blocks[2];
+    pre.AddBranch(&header);
+    header.AddBranch(&latch);
+    latch.AddBranch(&header);
+    latch.AddBranch(program.blocks[3]);
+    auto &phi = header.AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &mask_block = invariant ? pre : header;
+    const auto input = Value(&mask_block.AppendNewInst(ValueOpcode::GetUserData,
+                                                      {Value(static_cast<ScalarReg>(0))}));
+    const auto m = Value(&mask_block.AppendNewInst(ValueOpcode::INotEqual32, {input, Value(0u)}));
+    header.AppendNewInst(ValueOpcode::WriteSharedU32, {Value(0u), Value(&phi), m});
+    const auto next = Value(&latch.AppendNewInst(ValueOpcode::IAdd32, {Value(&phi), Value(1u)}));
+    auto &carried = latch.AppendNewInst(ValueOpcode::SelectU32, {m, next, Value(&phi)});
+    phi.AddPhiOperand(&pre, Value(0u));
+    phi.AddPhiOperand(&latch, Value(&carried));
+    (void)EliminateMaskedSelects(program);
+    Check((carried.GetOpcode() != ValueOpcode::SelectU32) == invariant,
+          "exec demand carried an iteration's lane mask across a loop back edge");
+  }
+
+  // And(a, a) with a = Select(m, p, false): where m is off, a is false and so is the And. A
+  // demand that narrowed both operands by the other would leave those lanes to neither, and
+  // replacing a by p would make the And p there. The first operand keeps the whole demand.
+  for (const bool both_operands : {true, false}) {
+    Program program;
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.blocks.push_back(program.block_storage.back().get());
+    auto &block = *program.blocks.front();
+    const auto mask_from = [&](uint32_t reg) {
+      const auto input = Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                                   {Value(static_cast<ScalarReg>(reg))}));
+      return Value(&block.AppendNewInst(ValueOpcode::INotEqual32, {input, Value(0u)}));
+    };
+    const auto m = mask_from(0);
+    const auto p = mask_from(1);
+    auto &a = block.AppendNewInst(ValueOpcode::SelectU1, {m, p, Value(false)});
+    // And(m, a) still narrows its second operand to m, where a is p.
+    auto &conjunction = block.AppendNewInst(
+        ValueOpcode::LogicalAnd, {both_operands ? Value(&a) : m, Value(&a)});
+    block.AppendNewInst(ValueOpcode::ReferenceU32,
+                        {Value(&block.AppendNewInst(ValueOpcode::SelectU32,
+                                                    {Value(&conjunction), Value(1u), Value(0u)}))});
+    (void)EliminateMaskedSelects(program);
+    Check((a.GetOpcode() == ValueOpcode::SelectU1) == both_operands,
+          "exec demand left the lanes where both operands of an And are false to neither");
+  }
+
+  // Repeated writes of one register under m: the second keeps the old value of the first, not
+  // the first's result. A write under another mask still chains.
+  {
+    Program program;
+    program.block_storage.push_back(std::make_unique<Block>());
+    program.blocks.push_back(program.block_storage.back().get());
+    auto &block = *program.blocks.front();
+    const auto mask_from = [&](uint32_t reg) {
+      const auto input = Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                                   {Value(static_cast<ScalarReg>(reg))}));
+      return Value(&block.AppendNewInst(ValueOpcode::INotEqual32, {input, Value(0u)}));
+    };
+    const auto m = mask_from(0);
+    const auto other = mask_from(1);
+    const auto base = Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                                 {Value(static_cast<ScalarReg>(2))}));
+    auto &first = block.AppendNewInst(ValueOpcode::SelectU32, {m, Value(1u), base});
+    auto &second = block.AppendNewInst(ValueOpcode::SelectU32, {m, Value(2u), Value(&first)});
+    auto &third = block.AppendNewInst(ValueOpcode::SelectU32, {other, Value(3u), Value(&second)});
+    block.AppendNewInst(ValueOpcode::ReferenceU32, {Value(&third)});
+    const auto stats = EliminateMaskedSelects(program);
+    Check(stats.chains_shortened == 1 && second.Arg(2) == base &&
+              third.Arg(2) == Value(&second) && !first.HasUses() &&
+              second.GetOpcode() == ValueOpcode::SelectU32,
+          "exec demand did not shorten a chain of writes under one mask");
+  }
 }
 
 void TestGraphicsCreateInterpolantMapping() {
@@ -13069,6 +13342,7 @@ int main() {
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
+  TestExecDemandSelects();
   TestNewShaderRecompilerUnbasedFlatUsesBda();
   TestNewShaderRecompilerFlatUserPointerUsesDma();
   TestNewShaderRecompilerFlatAddressDomainsUseDma();

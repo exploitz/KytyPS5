@@ -164,6 +164,7 @@ struct Buffer::Sparse {
 	uint32_t                    free_in_chunk = 0; // pages of the last chunk not bound yet
 	VkSemaphore                 timeline      = VK_NULL_HANDLE;
 	uint64_t                    value         = 0;
+	VkFence                     own_fence     = VK_NULL_HANDLE; // KYTY_BDA_SPARSE_BIND=own
 };
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
@@ -304,6 +305,7 @@ Buffer::~Buffer() {
 		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer(native_device, static_cast<VkBuffer>(m_buffer), nullptr);
 		for (const auto chunk: m_sparse->chunks) VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(native_device, chunk, nullptr);
 		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroySemaphore(native_device, m_sparse->timeline, nullptr);
+		if (m_sparse->own_fence != VK_NULL_HANDLE) VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyFence(native_device, m_sparse->own_fence, nullptr);
 		return;
 	}
 	if (m_buffer != nullptr) {
@@ -449,9 +451,60 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 }
 
+// KYTY_BDA_SPARSE_BIND=own, our 10-07 page table's way (an A/B against his): each page its own memory, bound on a queue
+// of its own (GraphicContext::sparse_queue) and waited for here on the CPU, then zeroed.
+void Buffer::MakeResidentOwnQueue(uint64_t offset, uint64_t size) {
+	auto&          sparse        = *m_sparse;
+	const auto     native_device = static_cast<VkDevice>(m_graphics->device);
+	const uint64_t first         = offset / sparse.page_size;
+	const uint64_t last          = std::min((offset + size - 1) / sparse.page_size, uint64_t {sparse.resident.size() - 1});
+	std::vector<VkSparseMemoryBind> binds;
+	for (uint64_t page = first; page <= last; ++page) {
+		if (sparse.resident[page] != 0) continue;
+		VkMemoryAllocateInfo allocate {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+		allocate.allocationSize  = sparse.page_size;
+		allocate.memoryTypeIndex = sparse.memory_type;
+		VkMemoryAllocateFlagsInfo zeroed {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+		zeroed.flags = VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT;
+		if (m_graphics->zero_initialize_memory) allocate.pNext = &zeroed;
+		VkDeviceMemory memory    = VK_NULL_HANDLE;
+		EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(native_device, &allocate, nullptr, &memory) != VK_SUCCESS);
+		sparse.chunks.push_back(memory);
+		binds.push_back({page * sparse.page_size, sparse.page_size, memory, 0, 0});
+		sparse.resident[page] = 1;
+	}
+	if (binds.empty()) return;
+	if (sparse.own_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fence {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateFence(native_device, &fence, nullptr, &sparse.own_fence) != VK_SUCCESS);
+	}
+	VkSparseBufferMemoryBindInfo buffer_bind {static_cast<VkBuffer>(m_buffer), static_cast<uint32_t>(binds.size()), binds.data()};
+	VkBindSparseInfo             info {VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+	info.bufferBindCount = 1;
+	info.pBufferBinds    = &buffer_bind;
+	static std::mutex queue_lock;
+	VkResult          result = VK_SUCCESS;
+	{
+		std::lock_guard lock(queue_lock);
+		result = VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueBindSparse(static_cast<VkQueue>(m_graphics->sparse_queue), 1, &info,
+		                                                         sparse.own_fence);
+	}
+	if (result == VK_SUCCESS)
+		result = VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitForFences(native_device, 1, &sparse.own_fence, VK_TRUE,
+		                                                       uint64_t {10} * 1000 * 1000 * 1000);
+	if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
+	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	(void)VULKAN_HPP_DEFAULT_DISPATCHER.vkResetFences(native_device, 1, &sparse.own_fence);
+	for (const auto& bind: binds) Fill(bind.resourceOffset, std::min(bind.size, m_size - bind.resourceOffset) & ~uint64_t {3}, 0);
+}
+
 void Buffer::MakeResident(uint64_t offset, uint64_t size) {
 	if (!m_sparse || size == 0 || offset >= m_size) return;
 	auto&          sparse = *m_sparse;
+	if (m_graphics->sparse_queue) {
+		MakeResidentOwnQueue(offset, size);
+		return;
+	}
 	const uint64_t first  = offset / sparse.page_size;
 	const uint64_t last   = std::min((offset + size - 1) / sparse.page_size, uint64_t {sparse.resident.size() - 1});
 	std::vector<VkSparseMemoryBind> binds;
@@ -461,6 +514,9 @@ void Buffer::MakeResident(uint64_t offset, uint64_t size) {
 			VkMemoryAllocateInfo allocate {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
 			allocate.allocationSize  = sparse.page_size * SparseChunkPages;
 			allocate.memoryTypeIndex = sparse.memory_type;
+			VkMemoryAllocateFlagsInfo zeroed {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+			zeroed.flags = VK_MEMORY_ALLOCATE_ZERO_INITIALIZE_BIT_EXT;
+			if (m_graphics->zero_initialize_memory) allocate.pNext = &zeroed; // (read zero once bound)
 			VkDeviceMemory chunk     = VK_NULL_HANDLE;
 			EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device), &allocate, nullptr, &chunk) !=
 			                     VK_SUCCESS);

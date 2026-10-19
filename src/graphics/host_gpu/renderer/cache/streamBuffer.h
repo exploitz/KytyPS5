@@ -84,11 +84,15 @@ public:
 	// them (a fill recorded in the current command buffer, whose submission waits for the binding on the GPU:
 	// CommandScheduler::WaitBeforeNextSubmit). Other buffers: nothing.
 	void MakeResident(uint64_t offset, uint64_t size);
+	void MakeResidentOwnQueue(uint64_t offset, uint64_t size); // (KYTY_BDA_SPARSE_BIND=own)
 
 	// BufferCache state lives directly on the resource (is_deleted also read by a speculative translation's thread).
 	std::atomic<bool> is_deleted {false};
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// The collector deleted a buffer at this address at the critical level and the game registered it again soon after
+	// (BufferCache::RunGarbageCollector): part of the working set.
+	bool came_back = false;
 	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch no
 	// LRU entry, so the stale-buffer retirement passes it over (BufferCache::RunGarbageCollector).
 	bool bda_read = false;

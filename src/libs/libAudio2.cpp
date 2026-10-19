@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Audio {
@@ -371,45 +373,86 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 	return false;
 }
 
+// The context's device (its first port with PCM on a real device), 0 without one.
+static int audioout2_context_device_handle(AudioOut2ContextHandle ctx) {
+	Common::LockGuard lock(g_audioout2_port_mutex);
+	for (const auto& state: g_audioout2_ports) {
+		if (state.used && state.context == ctx && state.audio_handle > 0 && state.pcm_data != nullptr &&
+		    AudioInternal::AudioOutHasDevice(state.audio_handle)) {
+			return state.audio_handle;
+		}
+	}
+	return 0;
+}
+
+// A context with a device counts its queue in the device's own queue: the grains it has not played
+// yet. The process clock used otherwise (one grain drained every 10,666 us for 512 samples, 10,666.7 in
+// truth, and a sound card's crystal off by its own few ppm) drifts from the card: the audio queued
+// ahead grew (the sound late against the picture, more so the longer one plays) or ran dry (gaps).
+// KYTY_AUDIO2_DEVICE_CLOCK=0: the process clock again.
+static bool audioout2_device_clock() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO2_DEVICE_CLOCK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// The device's queue in grains (rounded up), or -1 when the context has no device to ask.
+static int64_t audioout2_device_queued_grains(AudioOut2ContextHandle ctx, uint32_t num_grains) {
+	if (!audioout2_device_clock()) return -1;
+	const int device = audioout2_context_device_handle(ctx);
+	if (device == 0) return -1;
+	const uint64_t queued_us = AudioInternal::AudioOutQueuedMicros(device);
+	const uint64_t grain_ns  = (num_grains == 0 ? 512u : num_grains) * 1000000000ULL / 48000u;
+	// Every 10 s: the device's queue, how far the sound runs behind the game.
+	static std::atomic<uint64_t> last_report {0};
+	const uint64_t               now  = LibKernel::KernelGetProcessTime();
+	auto                         last = last_report.load(std::memory_order_relaxed);
+	if (now >= last + 10000000 && last_report.compare_exchange_strong(last, now)) {
+		std::printf("AudioOut2: the device has %.1f ms queued\n", static_cast<double>(queued_us) / 1000.0);
+		std::fflush(stdout);
+	}
+	return grain_ns != 0 ? static_cast<int64_t>((queued_us * 1000ULL + grain_ns - 1) / grain_ns) : -1;
+}
+
 // The object ports (mono float) are for the system's 3D audio to render. Demon's Souls puts its whole
 // game mix there as ambisonics: two fifth-order scenes, one channel per port (attribute 8 = 0x40 | ACN,
-// SN3D, its beds silent). Decoded here for stereo from the first order (W, Y left positive, X front
-// positive) by two virtual microphones facing about 74 degrees left and right: a sound straight ahead
-// plays at full level on both sides, as a binaural render plays it, one behind at -3 dB (the level of
-// a surround downmix), and one at the side with the power it has ahead. Cardioids facing 90 degrees
-// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. An object
-// that is no ambisonics channel plays in the centre. Each port's gain applies, and the result goes to
-// the front left and right of the context's first float main port. Adding the 36 channels up instead
-// cancelled most directions.
+// SN3D, its beds silent). The first order is decoded into the context's float main port: the front
+// pair as two virtual cardioids facing left and right (W and Y, +Y = left); on an 8-channel bed the
+// centre and the four surrounds as cardioids facing their speakers (W, X, Y; +X = front), so sounds
+// behind the player come from behind. Higher orders are dropped (summing all 36 channels cancels
+// most directions). An object port that is no ambisonics channel plays in the centre of the front
+// pair. Each port's gain applies. KYTY_AUDIO_OBJECTS=0 turns the objects off.
+// KYTY_AUDIO_FRONT_FOCUS=1 (chen's 604bb1fc, opt-in here): the front pair's virtual microphones face about
+// 74 degrees and take X too, so a sound straight ahead (an NPC the player faces) plays at full level on both
+// sides, 3 dB above the cardioids, one behind at -3 dB, and one at the side with the power it has ahead.
 static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
-	constexpr float HALF_POWER = 0.70710677f;
-	// Ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
-	constexpr float W_GAIN = 0.85355339f;
-	constexpr float X_GAIN = 0.14644661f;
-	constexpr float Y_GAIN = 0.52100538f;
-	thread_local std::vector<float> mix;
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AUDIO_OBJECTS");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) {
+		return target.pcm_data;
+	}
+	static const bool front_focus = [] {
+		const char* value = std::getenv("KYTY_AUDIO_FRONT_FOCUS");
+		return value != nullptr && value[0] == '1';
+	}();
+	constexpr float                 HALF_POWER = 0.70710677f;
+	// (Front focus) ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
+	constexpr float                 W_GAIN = 0.85355339f;
+	constexpr float                 X_GAIN = 0.14644661f;
+	constexpr float                 Y_GAIN = 0.52100538f;
+	thread_local std::vector<float> mix, w, x, y;
 	const auto channels = audioout2_data_format_channels(target.data_format);
 	const auto frames   = target.samples_num;
-	bool       mixed    = false;
+	bool       mixed = false, ambisonic = false;
 	for (const auto& object: g_audioout2_ports) {
 		if (!object.used || object.context != ctx || !audioout2_port_type_is_object(object.port_type) ||
 		    object.pcm_data == nullptr || !object.pcm_fresh || object.audio_format != AudioInternal::Format::FloatMono ||
 		    object.samples_num != frames) {
 			continue;
-		}
-		float left = HALF_POWER, right = HALF_POWER;
-		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
-			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
-			if (acn == 0) {
-				left = right = W_GAIN;
-			} else if (acn == 1) {
-				left  = Y_GAIN;
-				right = -Y_GAIN;
-			} else if (acn == 3) {
-				left = right = X_GAIN;
-			} else {
-				continue;
-			}
 		}
 		if (!mixed) {
 			const auto* bed = static_cast<const float*>(target.pcm_data);
@@ -417,11 +460,53 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 			mixed = true;
 		}
 		const auto* in = static_cast<const float*>(object.pcm_data);
-		left *= object.gain;
-		right *= object.gain;
+		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
+			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
+			std::vector<float>* component = acn == 0 ? &w : acn == 1 ? &y : acn == 3 ? &x : nullptr;
+			if (component == nullptr) {
+				continue; // Z and the higher orders
+			}
+			if (!ambisonic) {
+				w.assign(frames, 0.0f);
+				x.assign(frames, 0.0f);
+				y.assign(frames, 0.0f);
+				ambisonic = true;
+			}
+			for (uint32_t frame = 0; frame < frames; frame++) {
+				(*component)[frame] += in[frame] * object.gain;
+			}
+			continue;
+		}
+		const float centre = HALF_POWER * object.gain;
 		for (uint32_t frame = 0; frame < frames; frame++) {
-			mix[static_cast<size_t>(frame) * channels] += in[frame] * left;
-			mix[static_cast<size_t>(frame) * channels + 1] += in[frame] * right;
+			mix[static_cast<size_t>(frame) * channels] += in[frame] * centre;
+			mix[static_cast<size_t>(frame) * channels + 1] += in[frame] * centre;
+		}
+	}
+	if (ambisonic) {
+		// Bed order: FL FR C LFE then (Std) BL BR SL SR or (non-Std) SL SR BL BR.
+		const bool     std_order = target.audio_format == AudioInternal::Format::Float8ChStd;
+		const uint32_t sl = channels >= 8 ? (std_order ? 6 : 4) : 0, sr = sl + 1;
+		const uint32_t bl = channels >= 8 ? (std_order ? 4 : 6) : 0, br = bl + 1;
+		// Cardioid facing azimuth a (left positive): 0.5 (W + cos a X + sin a Y); the back pair at 150 degrees.
+		constexpr float C150 = -0.8660254f, S150 = 0.5f;
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			const float  wf = w[frame], xf = x[frame], yf = y[frame];
+			const size_t at = static_cast<size_t>(frame) * channels;
+			if (front_focus) {
+				mix[at + 0] += W_GAIN * wf + X_GAIN * xf + Y_GAIN * yf;
+				mix[at + 1] += W_GAIN * wf + X_GAIN * xf - Y_GAIN * yf;
+			} else {
+				mix[at + 0] += HALF_POWER * (wf + yf);
+				mix[at + 1] += HALF_POWER * (wf - yf);
+			}
+			if (channels >= 8) {
+				mix[at + 2] += 0.35f * (wf + xf);
+				mix[at + sl] += 0.5f * (wf + yf);
+				mix[at + sr] += 0.5f * (wf - yf);
+				mix[at + bl] += 0.5f * (wf + C150 * xf + S150 * yf);
+				mix[at + br] += 0.5f * (wf + C150 * xf - S150 * yf);
+			}
 		}
 	}
 	return mixed ? mix.data() : target.pcm_data;
@@ -643,12 +728,28 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
+// The context's queue: from its device when it has one (see audioout2_device_queued_grains), else drained
+// by the process clock.
+static void audioout2_refresh_context(AudioOut2ContextHandle ctx) {
+	uint32_t num_grains = 0;
+	g_audioout2_context_mutex.Lock();
+	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) num_grains = state->num_grains;
+	g_audioout2_context_mutex.Unlock();
+	const int64_t device_grains = audioout2_device_queued_grains(ctx, num_grains);
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
+		if (device_grains >= 0) {
+			state->queued      = static_cast<uint32_t>(std::min<int64_t>(device_grains, state->queue_depth));
+			state->last_update = LibKernel::KernelGetProcessTime();
+		} else {
+			audioout2_update_context_locked(state);
+		}
 	}
 	g_audioout2_context_mutex.Unlock();
+}
+
+int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
+	audioout2_refresh_context(ctx);
 
 	return OK;
 }
@@ -662,10 +763,15 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 		// vibration/failed-open handle) has no downstream operation that can block this call.
 		const bool use_device_clock =
 		    blocking != 0 && audioout2_context_has_queueable_device(ctx);
+		static std::atomic<bool> reported {false};
+		if (!reported.exchange(true)) {
+			std::printf("AudioOut2: the game pushes %s\n", blocking != 0 ? "blocking" : "without blocking");
+			std::fflush(stdout);
+		}
+		audioout2_refresh_context(ctx);
 
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			audioout2_update_context_locked(state);
 			sleep_micros = audioout2_grain_micros(state->num_grains);
 			if (state->queued < state->queue_depth || use_device_clock) {
 				if (state->queued == 0) {
@@ -698,9 +804,9 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 		*available_queues = 4;
 	}
 
+	audioout2_refresh_context(ctx);
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
 		if (queue_level != nullptr) {
 			*queue_level = state->queued;
 		}

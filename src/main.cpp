@@ -16,6 +16,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
+#if defined(KYTY_MIMALLOC)
+// Replaces operator new/delete for the whole executable (one translation unit only).
+#include <mimalloc-new-delete.h>
+#endif
 
 using namespace Common;
 using namespace Emulator;

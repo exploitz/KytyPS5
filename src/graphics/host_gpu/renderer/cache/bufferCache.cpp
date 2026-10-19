@@ -58,6 +58,8 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <string_view>
 #include <cstring>
 #include <fmt/format.h>
 #include <string>
@@ -74,6 +76,9 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+// Idle frames before the collector deletes a buffer: while memory is plentiful, and at the critical level.
+constexpr uint64_t GcPlentifulAge = 600;
+constexpr uint64_t GcCriticalAge  = 32;
 
 // AsyncUpload call (context: the guest address): an image span with unmapped parts (a streamed
 // texture pool) into staging, the mapped parts as they are and the rest as zeros.
@@ -164,8 +169,15 @@ static bool GuestReadbacksEnabled() {
 std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
     uint64_t address, uint64_t size, bool* completed) {
 	if (completed) *completed = false;
-	constexpr uint64_t WindowSize = 512 * 1024;
-	constexpr uint64_t Capacity = 2 * WindowSize;
+	// KYTY_READBACK_WINDOW_KB (default 512): the span around a guest read one readback covers. Wide
+	// shares one GPU drain among nearby reads (his choice); upstream 0ce84e59 went to the exact
+	// range for its synchronous path. 55% of the bytes read back here were real (2026-10-04).
+	static const uint64_t WindowSize = [] {
+		const char* value = std::getenv("KYTY_READBACK_WINDOW_KB");
+		const auto  kb    = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+		return (kb >= 4 && kb <= 4096 ? kb : 512) * 1024;
+	}();
+	const uint64_t Capacity = std::max<uint64_t>(2 * WindowSize, 1024 * 1024);
 	if (!m_resources || !GuestRange {address, size}.Valid() || size > WindowSize) {
 		LiveCounters::Add(LiveCounters::RbRejectSize);
 		return {};
@@ -311,14 +323,19 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		if (completed) *completed = true;
 		return {};
 	}
-	// The copies' envelopes in packed regions, one region for envelopes less than 64 KiB apart (the
-	// bytes between are copied too and never written back): GPU writes split a window into up to
-	// thousands of small ranges, a copy command each otherwise (seconds of driver calls in one frame).
+	// The copies' envelopes in packed regions (the bytes between are copied too and never written
+	// back): GPU writes split a window into up to thousands of small ranges, a copy command each
+	// otherwise (seconds of driver calls in one frame). One region per request by default: the
+	// window is at most 512 KiB, so one copy moves it, where a 64 KiB merging gap left several.
+	// KYTY_READBACK_MERGE_GAP=<bytes> restores a gap (65536 = the old behaviour).
 	// The parts place each copy's bytes in the download.
 	struct Envelope {
 		uint64_t source, size, cursor;
 	};
-	constexpr uint64_t                 Gap = 64 * 1024;
+	static const uint64_t Gap = [] {
+		const char* value = std::getenv("KYTY_READBACK_MERGE_GAP");
+		return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 0) : UINT64_MAX / 4;
+	}();
 	thread_local std::vector<Envelope> envelopes_home;
 	ScratchValue                       envelopes_scratch(envelopes_home);
 	auto&                              envelopes = *envelopes_scratch;
@@ -683,7 +700,25 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 				               request->producer_tick);
 		}
 		const auto* source = (request->verify != nullptr ? request->verify : request->download)->Mapped().data();
-		for (const auto& part: request->parts) WriteBackGpuOwned(part.address, source + part.offset, part.size, "readback");
+		for (const auto& part: request->parts) {
+			// Probe: how much of a readback is news to the guest. Bytes equal to what its memory
+			// already held were downloaded for a write the GPU never made (coarse write tracking).
+			if (LiveCounters::g_probe_readback_bytes) {
+				static thread_local std::vector<uint8_t> before;
+				before.resize(part.size);
+				if (LibKernel::Memory::TryReadBacking(part.address, before.data(), part.size)) {
+					uint64_t changed = 0;
+					for (uint64_t i = 0; i < part.size; i += 16) {
+						const auto n = std::min<uint64_t>(16, part.size - i);
+						if (std::memcmp(before.data() + i, source + part.offset + i, n) != 0) changed += n;
+					}
+					LiveCounters::Add(LiveCounters::ReadbackBytes, part.size);
+					LiveCounters::Add(LiveCounters::ReadbackBytesChanged, changed);
+				}
+			}
+			// Only onto pages the GPU still owns (his 79d57528).
+			WriteBackGpuOwned(part.address, source + part.offset, part.size, "readback");
+		}
 	}
 	request->copied.store(true, std::memory_order_release);
 	request->copied.notify_all();
@@ -986,8 +1021,22 @@ void BufferCache::Unregister(BufferId id) {
 	ChangeRegister<false>(id);
 }
 
+void BufferCache::EnsureBdaPageTableInitialized() {
+	if (m_bda_pagetable_initialized) return;
+	// Recorded before the first table write or read, ordered by Fill's barriers. (A sparse table reads zero where
+	// nothing is bound: ChangeRegister clears each page it binds.)
+	if (m_bda_pagetable_buffer.Usage() != MemoryUsage::SparseDeviceLocal) m_bda_pagetable_buffer.Fill(0, m_bda_pagetable_buffer.Size(), 0);
+	m_bda_pagetable_initialized = true;
+}
+
+Buffer* BufferCache::GetBdaPageTableBuffer() {
+	EnsureBdaPageTableInitialized();
+	return &m_bda_pagetable_buffer;
+}
+
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
+	EnsureBdaPageTableInitialized();
 	DrainGuestReadback(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
 	m_sync_buffers_valid = false;
 	if (!m_sync_changes_lost) {
@@ -1032,7 +1081,11 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		m_accounted_bytes += buffer.Size();
+		++m_accounted_buffers;
+		++m_registrations;
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		if (TakeCollected(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size())) buffer.came_back = true;
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -1047,11 +1100,31 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.erase(found);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
+		m_accounted_bytes -= buffer.Size();
+		--m_accounted_buffers;
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
+}
+
+// Whether the collector freed part of [begin, end) at the critical level within the plentiful age (those ranges are
+// forgotten here): a buffer registered over them came back.
+bool BufferCache::TakeCollected(uint64_t begin, uint64_t end) {
+	if (m_collected.empty()) return false;
+	bool came_back = false;
+	auto it        = m_collected.lower_bound(begin);
+	if (it != m_collected.begin() && std::prev(it)->second.first > begin) --it;
+	while (it != m_collected.end() && it->first < end) {
+		if (it->second.first > begin) {
+			came_back |= m_gc_tick - it->second.second <= GcPlentifulAge;
+			it = m_collected.erase(it);
+		} else {
+			++it;
+		}
+	}
+	return came_back;
 }
 
 bool BufferCache::IsGpuMapped(uint64_t vaddr, uint64_t size) const noexcept {
@@ -1298,7 +1371,7 @@ bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
     }
     m_scheduler.EndRendering();
     const auto command = m_scheduler.Current().Handle();
-    vk::MemoryBarrier barrier {};
+    VulkanMemoryBarrier barrier {};
     barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
     barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
     command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader,
@@ -1410,9 +1483,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	constexpr int64_t target_threshold = 8 * GiB;
 	const auto        budget =
 	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+	// KYTY_GC_THRESHOLDS=old: his levels (see TextureCache); otherwise collection from 1.5 GB under
+	// the card's budget, critical from 0.6 GB under it.
+	static const bool old_levels = [] {
+		const char* value = std::getenv("KYTY_GC_THRESHOLDS");
+		return value != nullptr && std::string_view(value) == "old";
+	}();
 	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
+	const auto expected  = old_levels ? std::min(budget - 6 * threshold / 10, budget - GiB) : budget - 3 * GiB / 2;
+	const auto critical  = old_levels ? std::min(budget - 2 * threshold / 10, budget - GiB / 2) : budget - 6 * GiB / 10;
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
@@ -1866,6 +1945,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.came_back |= overlap.came_back;
 	new_buffer.bda_read |= overlap.bda_read;
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
@@ -2841,9 +2921,6 @@ void BufferCache::RunGarbageCollector(bool collect) {
 	// guest memory through device addresses). At the end of a submission its command buffer still records
 	// (EndSubmission, before the flush).
 	if (tick % 60 == 0) (void)MoveSpilledBufferBack();
-	if (!collect) {
-		return;
-	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
@@ -2872,6 +2949,17 @@ void BufferCache::RunGarbageCollector(bool collect) {
 			m_critical_gc_memory = critical;
 		}
 	}
+	// `collect` is false after a frame with shaders reading guest memory through the BDA page table
+	// (a buffer collected under one faults back at once). The game's culling does that every frame,
+	// so buffers were never collected in play and grew until the card paged; at the critical level
+	// the fault-backs cost less than the paging. KYTY_GC_BDA_CRITICAL=0 keeps the old rule.
+	static const bool collect_at_critical = [] {
+		const char* value = std::getenv("KYTY_GC_BDA_CRITICAL");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!collect && !(collect_at_critical && m_total_used_memory >= m_critical_gc_memory)) {
+		return;
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -2880,15 +2968,26 @@ void BufferCache::RunGarbageCollector(bool collect) {
 	DrainGuestReadback();
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	// Idle frames before a buffer goes: 15 s while memory is plentiful (re-registering costs an upload
+	// and a page-table rewrite), 32 at the critical level.
+	const uint64_t age        = std::min<uint64_t>(aggressive ? GcCriticalAge : GcPlentifulAge, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
+	// A buffer the collector deleted at the critical level that the game registered again is in its working set:
+	// deleting it again frees nothing and costs its re-creation, re-upload and page-table rewrite. (Buffers read through
+	// the BDA page table are never touched in the LRU, so they look idle.) At 1-1 on a 12 GB card the process sits
+	// between the critical level and the card's budget and ~25 buffers a frame were registered again; keeping those
+	// below the card's own budget (paging starts above it, not at the caches' margins): 2-5 a frame, +7.2% same-process,
+	// buffers +150 MiB. Above the budget they go at the critical age again.
+	const bool keep_came_back = aggressive && m_total_used_memory < m_graphics.GetDeviceMemoryBudget();
+	if (m_collected.size() > 4096) std::erase_if(m_collected, [&](const auto& entry) { return tick - entry.second.second > GcPlentifulAge; });
 
 	std::vector<BufferId> dirty_buffers;
 	std::vector<DownloadCopy> copies;
 	size_t                    retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id, uint64_t last_used) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (keep_came_back && buffer.came_back && tick - last_used < GcPlentifulAge) return false;
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
@@ -2911,8 +3010,10 @@ void BufferCache::RunGarbageCollector(bool collect) {
 				});
 			dirty_buffers.push_back(id);
 		} else {
+			if (aggressive) m_collected[buffer.CpuAddress()] = {buffer.CpuAddress() + buffer.Size(), tick};
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
+			++m_gc_deletions;
 		}
 		return ++retire_count == limit;
 	});
@@ -2930,10 +3031,12 @@ void BufferCache::RunGarbageCollector(bool collect) {
 		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
+		m_collected[buffer.CpuAddress()] = {buffer.CpuAddress() + buffer.Size(), tick}; // (dirty: critical level only)
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		// Freed once the GPU is done with it: a download on the readback queue (KYTY_READBACK_QUEUE)
 		// waits only for the last write, not for the reads in flight or the commands recorded so far.
 		DeleteBuffer(id);
+		++m_gc_deletions;
 	}
 }
 

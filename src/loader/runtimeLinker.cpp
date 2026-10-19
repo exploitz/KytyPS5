@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "libs/ajm/decoder.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -842,6 +843,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
 			std::printf("Guest debug break (int 0x41) at %s skipped: no debugger\n",
 			            DescribeGuestAddress(info->exception_address).c_str());
+			Libs::Audio::Ajm::AjmDumpRecentJobs(); // the audio engine's assertion follows a decode
 			std::fflush(stdout);
 		}
 		return true;
@@ -902,8 +904,33 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 			}
 		}
+		Libs::Audio::Ajm::AjmDumpRecentJobs();
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
+		// Registers that point at printable text (an assertion's file name and message, say).
+		{
+			const struct {
+				const char* name;
+				uint64_t    value;
+			} regs[] = {{"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+			            {"rsi", info->rsi}, {"rdi", info->rdi}, {"r8", info->r8},   {"r9", info->r9},
+			            {"r10", info->r10}, {"r12", info->r12}, {"r13", info->r13}, {"r14", info->r14},
+			            {"r15", info->r15}};
+			for (const auto& reg: regs) {
+				if (!IsReadableRange(reg.value, 96)) {
+					continue;
+				}
+				const auto* text = reinterpret_cast<const char*>(reg.value);
+				size_t      n    = 0;
+				while (n < 95 && text[n] >= 0x20 && text[n] < 0x7f) {
+					n++;
+				}
+				if (n >= 4) {
+					std::printf("%s -> \"%.*s\"%s\n", reg.name, static_cast<int>(n), text,
+					            n == 95 ? "..." : "");
+				}
+			}
+		}
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"

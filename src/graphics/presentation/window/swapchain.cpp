@@ -18,6 +18,9 @@
 #include "vulkan-recording.h"
 #endif
 #include "frame-gen.h"
+#include "live-shot.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "fsr-frame-gen.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
 #if defined(_WIN32)
@@ -336,6 +339,17 @@ public:
 	}
 	// Where RecordPresentCommands put the frame in the swapchain image.
 	[[nodiscard]] vk::Rect2D PresentRegion() const noexcept { return m_present_region; }
+	// KYTY_FRAMEGEN_FSR: the swapchain is FidelityFX's frame-interpolation one.
+	[[nodiscard]] bool             UsesFsr() const noexcept { return m_fsr; }
+	// The window's size differs from the one the swapchain was made for. FidelityFX's swapchain does not
+	// report a resized window as out of date (after Alt+Enter it kept presenting at the old size, then
+	// stopped presenting while the game ran on), so with it the presenter checks this before each frame.
+	[[nodiscard]] bool WindowResized() {
+		Common::LockGuard lock(m_window.mutex);
+		return m_window.graphic_ctx.screen_width != m_window_size.width ||
+		       m_window.graphic_ctx.screen_height != m_window_size.height;
+	}
+	[[nodiscard]] vk::SwapchainKHR Handle() const noexcept { return m_handle; }
 	// The presents wait for the display's vertical blank (VSync: FIFO).
 	[[nodiscard]] bool IsFifo() const noexcept { return m_fifo.load(std::memory_order_relaxed); }
 
@@ -345,12 +359,14 @@ private:
 
 	WindowContext&              m_window;
 	vk::SwapchainKHR            m_handle = nullptr;
+	bool                        m_fsr    = false;
 	vk::Format                  m_format = vk::Format::eUndefined;
 	std::atomic_bool            m_hdr_supported {false};
 	std::atomic_bool            m_fifo {true};
 	bool                        m_hdr_requested = false;
 	bool                        m_hdr_active    = false;
 	vk::Extent2D                m_extent {};
+	vk::Extent2D                m_window_size {}; // the window's size when the swapchain was made
 	std::vector<vk::Image>      m_images;
 	std::vector<vk::ImageView>  m_image_views;
 	std::vector<vk::Semaphore>  m_image_acquired;
@@ -469,17 +485,38 @@ struct Presenter::Impl {
 
 	// The shader prefetch's progress line while it runs, and for a few seconds after.
 	std::chrono::steady_clock::time_point prefetch_finished {};
+	std::chrono::steady_clock::time_point building_since {}; // the compile workers busy since (zero: idle)
 	void UpdateStatus(std::chrono::steady_clock::time_point now) {
 		const auto progress = renderer.GetPipelineCache().GetPrefetchProgress();
+		auto       building = renderer.GetPipelineCache().PipelinesBuilding();
+		// Pipelines compiling while play meets them (a place the precompile lacks): said so, with their number, once
+		// the workers have been busy for 100 ms (a pipeline the driver's cache holds takes a few ms: no flicker for those).
+		if (building == 0) {
+			building_since = {};
+		} else if (building_since == std::chrono::steady_clock::time_point {}) {
+			building_since = now;
+			building       = 0;
+		} else if (now - building_since < std::chrono::milliseconds(100)) {
+			building = 0;
+		}
 		hud.status.clear();
-		if (progress.total == 0) {
+		std::array<char, 128> line {};
+		if (progress.total == 0 || (progress.done >= progress.total && progress.label == nullptr && building != 0)) {
+			if (building == 0) return;
+			std::snprintf(line.data(), line.size(), "Compiling shaders (%u)", building);
+			hud.status          = line.data();
+			hud.status_fraction = 0.0f;
 			return;
 		}
-		std::array<char, 128> line {};
 		if (progress.done < progress.total || progress.label != nullptr) {
-			std::snprintf(line.data(), line.size(), "%s %zu%%  (%zu / %zu)",
-			              progress.label != nullptr ? progress.label : "Preparing shaders", progress.done * 100 / progress.total,
-			              progress.done, progress.total);
+			// (The store's programs load in seconds; the ones added to it this launch are what takes the time.)
+			if (progress.adding != 0)
+				std::snprintf(line.data(), line.size(), "%s, adding %zu %zu%%  (%zu / %zu)", progress.label, progress.adding,
+				              progress.done * 100 / progress.total, progress.done, progress.total);
+			else
+				std::snprintf(line.data(), line.size(), "%s %zu%%  (%zu / %zu)",
+				              progress.label != nullptr ? progress.label : "Preparing shaders", progress.done * 100 / progress.total,
+				              progress.done, progress.total);
 		} else {
 			if (prefetch_finished == std::chrono::steady_clock::time_point {}) {
 				prefetch_finished = now;
@@ -520,15 +557,18 @@ struct Presenter::Impl {
 		PerfOverlay::RecentFrames(300, &hud.perf.frame_ms, level >= 2 ? &hud.perf.busy_ms : nullptr);
 		const double seconds = std::chrono::duration<double>(now - hud_window).count();
 		if (seconds >= 1.0) {
-			// The emulator's own frame rate (the game's flips) is the number; with frame generation, the frames DLSS-G
-			// presents (those it got, each with its generated ones) are, and the game's rate is below it.
+			// The emulator's own frame rate (the game's flips) is the number; with frame generation, the frames presented
+			// (those the generator got, each with its generated ones) are, and the game's rate is below it.
 			const double   game     = PerfOverlay::Summarize(seconds).fps;
-			const uint32_t presents = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
+			const uint32_t presents = FsrFrameGen::Enabled() ? FsrFrameGen::PresentedFrames()
+			                          : FrameGen::Enabled()  ? FrameGen::PresentedFrames()
+			                                                 : 1u;
 			std::array<char, 32>  title {};
 			std::array<char, 128> detail {};
 			if (presents > 1) {
 				std::snprintf(title.data(), title.size(), "%.0f FPS", hud_frames / seconds * presents);
-				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps", presents, game);
+				std::snprintf(detail.data(), detail.size(), "%s Frame Generation %ux  |  game %.0f fps",
+				              FsrFrameGen::Enabled() ? "FSR" : "DLSS", presents, game);
 			} else {
 				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
 			}
@@ -690,7 +730,8 @@ void Swapchain::Create() {
 	const auto&       surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
-	m_extent = surface.capabilities.currentExtent;
+	m_window_size = {graphics.screen_width, graphics.screen_height};
+	m_extent      = surface.capabilities.currentExtent;
 	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
 		m_extent.width =
 		    std::clamp(graphics.screen_width, surface.capabilities.minImageExtent.width,
@@ -750,8 +791,16 @@ void Swapchain::Create() {
 	}
 	m_fifo.store(create_info.presentMode == vk::PresentModeKHR::eFifo, std::memory_order_relaxed);
 	create_info.clipped          = VK_TRUE;
-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
-	                     "vkCreateSwapchainKHR");
+	// KYTY_FRAMEGEN_FSR: FidelityFX's frame-interpolation swapchain stands in (its functions
+	// then acquire and present too).
+	m_fsr = FsrFrameGen::Enabled();
+	if (m_fsr) {
+		RequireVulkanSuccess(FsrFrameGen::CreateSwapchain(create_info, graphics.queue, graphics.queue_mutex, &m_handle),
+		                     "FSR frame-interpolation swapchain");
+	} else {
+		RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+		                     "vkCreateSwapchainKHR");
+	}
 	EXIT_IF(m_handle == nullptr);
 	if (Config::HdrEnabled()) {
 		std::printf("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
@@ -760,7 +809,8 @@ void Swapchain::Create() {
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
-		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
+		    return m_fsr ? FsrFrameGen::GetSwapchainImages(m_handle, count, images)
+		                 : graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
 
@@ -837,7 +887,11 @@ void Swapchain::Destroy() {
 		}
 	}
 	if (m_handle != nullptr) {
-		graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		if (m_fsr) {
+			FsrFrameGen::DestroySwapchain(); // the swapchain belongs to its context
+		} else {
+			graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		}
 	}
 
 	m_handle      = nullptr;
@@ -869,9 +923,11 @@ void Swapchain::Recreate(bool surface_lost) {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result = m_fsr ? FsrFrameGen::AcquireNextImage(m_handle, std::numeric_limits<uint64_t>::max(),
+	                                                            m_image_acquired[m_frame_index], &m_image_index)
+	                          : m_window.graphic_ctx.device.acquireNextImageKHR(
+	                                m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index],
+	                                nullptr, &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1043,7 +1099,12 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
-	if (auto& graphics = m_window.graphic_ctx; graphics.present_queue != nullptr) {
+	if (auto& graphics = m_window.graphic_ctx; m_fsr) {
+		// The frame-interpolation swapchain presents from its own queues; its entry point takes
+		// the game queue it was created with, and submits there through a function that takes
+		// queue_mutex itself (so not held here).
+		result = FsrFrameGen::QueuePresent(graphics.queue, present);
+	} else if (graphics.present_queue != nullptr) {
 		// Its own queue: a present blocked in the kernel does not hold up other submissions.
 		Common::LockGuard lock(graphics.present_queue_mutex);
 		result = graphics.present_queue.presentKHR(&present);
@@ -1099,6 +1160,30 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	// (Live `shot`: the frame's pixels downloaded behind the copy, written once the GPU is done.)
+	uint64_t    shot_id = 0;
+	std::string shot_path;
+	if (LiveShot::Take(shot_id, shot_path)) {
+		const uint32_t width = frame->image.extent.width, height = frame->image.extent.height;
+		const int      format = static_cast<int>(frame->image.format);
+		auto& scheduler = m_impl->renderer.GetCommandScheduler();
+		auto  download  = std::make_shared<Buffer>(m_impl->window.graphic_ctx, scheduler, MemoryUsage::Download, 0,
+		                                           vk::BufferUsageFlagBits::eTransferDst, uint64_t {width} * height * 4u);
+		vk::BufferImageCopy region {};
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.imageExtent      = vk::Extent3D {width, height, 1};
+		buffer.Handle().copyImageToBuffer(frame->image.image, vk::ImageLayout::eTransferSrcOptimal, download->Handle(), 1,
+		                                  &region);
+		VulkanMemoryBarrier to_host {};
+		to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		buffer.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+		                                &to_host, 0, nullptr, 0, nullptr);
+		scheduler.DeferOperation([download, width, height, format, shot_id, shot_path] {
+			download->Invalidate(0, uint64_t {width} * height * 4u);
+			LiveShot::Write(shot_id, shot_path, download->Mapped().data(), width, height, format);
+		});
+	}
 	frame->scene    = FrameGen::TakeScene();
 	frame->fg.valid = false;
 	if (FrameGen::Enabled()) {
@@ -1257,6 +1342,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		if (swapchain.UsesFsr() && swapchain.WindowResized()) m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);
@@ -1283,7 +1369,27 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				    (static_cast<float>(hud->drawn.offset.x - region.offset.x) + static_cast<float>(hud->drawn.extent.width) + margin) / w,
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
-			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene);
+			if (swapchain.UsesFsr()) {
+				// KYTY_FRAMEGEN_FSR: the frame without its HUD scaled like the presented one, the
+				// generation's prepare pass (this frame's depth, motion vectors and camera) ahead of
+				// the blit, and the coming present configured.
+				if (frame.fg.valid && !frame.reusing_last && frame.fg.hudless_valid) {
+					FrameGen::BlitHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(),
+					                      swapchain.Format(), swapchain.PresentRegion());
+				}
+				FsrFrameGen::PrepareFrame(command.Handle(), frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
+				                          swapchain.Extent(), swapchain.PresentRegion(), swapchain.Handle());
+			}
+			// KYTY_FRAMEGEN_FSR_HUDLESS=show: the frame without its HUD is presented instead (a check
+			// that it is the game's image minus the HUD; BlitHudless leaves it a transfer source).
+			static const bool show_hudless = [] {
+				const char* value = std::getenv("KYTY_FRAMEGEN_FSR_HUDLESS");
+				return value != nullptr && std::string_view(value) == "show";
+			}();
+			const bool hudless_shown = show_hudless && swapchain.UsesFsr() && frame.fg.valid && !frame.reusing_last &&
+			                           frame.fg.hudless_backbuffer_valid;
+			swapchain.RecordPresentCommands(command, hudless_shown ? frame.fg.hudless : frame.image, draw_system_overlay,
+			                               frame.scene);
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
 #if defined(_WIN32)

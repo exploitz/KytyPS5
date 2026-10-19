@@ -24,6 +24,9 @@ extern "C" {
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_unmap_protect_skip_mode {0};
 }
 
+extern "C" {
+extern volatile std::atomic<uint32_t> kyty_local_gc_flip_hook; // graphicsRun.cpp
+}
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -413,7 +416,9 @@ void GpuResourceManager::EndSubmission() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	if (std::exchange(m_gpu_flip_pending, false)) RunCollectors();
+	// (kyty_local_gc_flip_hook 1: GuestGpu::AdvanceFrameAfterGpuFlip collects instead.)
+	if (std::exchange(m_gpu_flip_pending, false) && kyty_local_gc_flip_hook.load(std::memory_order_relaxed) == 0)
+		RunCollectors();
 }
 
 void GpuResourceManager::AdvanceFrame() {

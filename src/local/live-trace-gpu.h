@@ -47,12 +47,15 @@ struct MarkAfter {
 template <typename Handle>
 MarkAfter(Handle, MarkKind, uint64_t) -> MarkAfter<Handle>;
 
-// generate-vulkan-recording.py: after an emulator-side work command on the GPU thread.
-inline void VulkanMark(VkCommandBuffer command, uint32_t id, bool dispatch) {
+// generate-vulkan-recording.py: after an emulator-side work command on the GPU thread. The tag
+// is the command id in the low byte and, above it, the renderer's call site (the wrapper's return
+// address: the vk::CommandBuffer inline is folded into the caller), so a trace attributes the
+// barriers and copies to the code that records them (gpu-marks-report.py symbolizes them).
+inline void VulkanMark(VkCommandBuffer command, uint32_t id, bool dispatch, const void* site = nullptr) {
 	if (!g_marks_on.load(std::memory_order_relaxed) || !g_mark_thread || command != g_mark_command ||
 	    (dispatch && g_mark_scope != 0))
 		return;
-	GpuMarkNow(vk::CommandBuffer(command), MarkVulkan, id);
+	GpuMarkNow(vk::CommandBuffer(command), MarkVulkan, (reinterpret_cast<uint64_t>(site) << 8u) | (id & 0xffu));
 }
 
 } // namespace LiveTrace

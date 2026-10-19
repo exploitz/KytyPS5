@@ -33,6 +33,18 @@
 #include <mutex>
 #include <vector>
 
+// This library's LOGF lines are the HLE calls' argument dumps (hundreds a frame, on the game's own
+// threads); they follow --graphics-debug-dump like CommandBuffer::DbgDump instead of printing
+// unconditionally into a file log (2026-10-04: about 3 MB/s of them, 1.4 GB in seven minutes).
+#undef LOGF
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define LOGF(...)                                                                                  \
+	do {                                                                                           \
+		if (Config::GraphicsDebugDumpEnabled() && !::Log::IsSilent()) {                            \
+			::Log::Write(::fmt::sprintf(__VA_ARGS__));                                             \
+		}                                                                                          \
+	} while (false)
+
 #ifdef min
 #undef min
 #endif

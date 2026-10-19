@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecDemand.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -33,6 +34,15 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
+
+// Per-phase progress of one compilation: shader logging only (--shader-log-direction, the
+// same switch as the IR dumps). The prefetch translates ~19,000 programs a launch; unconditional,
+// these lines were 38 million a run in the file log.
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define PHASE_LOGF(...)                                                                            \
+	do {                                                                                           \
+		if (options.dump_ir) LOGF(__VA_ARGS__);                                                      \
+	} while (false)
 
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
@@ -597,7 +607,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                                 .count());
 	};
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+	PHASE_LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
@@ -621,7 +631,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
 	                  decoded);
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
+	PHASE_LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
@@ -634,10 +644,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
+	PHASE_LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
 	auto cfg = CFG::BuildGraph(decoded);
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+	PHASE_LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
@@ -650,7 +660,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		LogDispatcherFallback(options, cfg, "build", dispatcher_reason);
 	} else {
 		const auto unstructured_cfg = cfg;
-		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+		PHASE_LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		if (!CFG::Structurize(cfg)) {
 			dispatcher_fallback      = true;
@@ -664,10 +674,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			cfg.failure_block      = failure_block;
 			cfg.unsupported_reason = dispatcher_reason;
 		} else {
-			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+			PHASE_LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(cfg.blocks.size()));
 		}
-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+		PHASE_LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 		     static_cast<uint64_t>(cfg.blocks.size()),
@@ -694,7 +704,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                                           static_cast<uint32_t>(options.user_data.size()),
 		                                           options.wave_size);
 		if (!embedded_fetch.loads.empty()) {
-			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
+			PHASE_LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(embedded_fetch.loads.size()));
 		}
 	}
@@ -714,10 +724,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .compute             = compute,
 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	PHASE_LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	PHASE_LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
@@ -728,7 +738,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::EliminateDeadCode(ir.blocks);
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
-		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
+		PHASE_LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
 		IR::ConstantPropagationPass(ir.blocks);
 		IR::ResolveControlFlowIdentities(ir);
@@ -775,6 +785,20 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		ir.lane_local = false;
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	// After the program's resources are tracked and specialized: what the pass leaves dead (an image
+	// sample only an overwritten old value read) must not change the resource list a recorded
+	// specialization (a warmup recipe, a seed) was made for.
+	if (options.exec_demand) {
+		const auto exec_demand = IR::EliminateMaskedSelects(ir);
+		if (exec_demand.selects_removed != 0 || exec_demand.chains_shortened != 0) {
+			PHASE_LOGF("%s exec demand: selects=%" PRIu32 " chains=%" PRIu32 "\n",
+			     GetDumpLabel(options), exec_demand.selects_removed, exec_demand.chains_shortened);
+			IR::ConstantPropagationPass(ir.blocks);
+			IR::ResolveControlFlowIdentities(ir);
+			IR::RemoveIdentities(ir.blocks);
+			IR::EliminateDeadCode(ir.blocks);
+		}
+	}
 
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;
@@ -804,10 +828,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
+	PHASE_LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
+	PHASE_LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(spirv.size()),

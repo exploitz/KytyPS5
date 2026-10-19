@@ -19,6 +19,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cstdlib>
+#include <string_view>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -93,6 +96,46 @@ constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Guest priority classes on host priorities (upstream PR #1050, tvhdev, measured on Demon's Souls):
+// the game starts 13 job workers at guest priority 700, each pinned to one core, spinning on a job
+// table; at the host's normal priority they share the cores with the emulator's GPU thread and
+// starve it (multi-second stalls on an 8-thread CPU). The guest band sits at or below normal (0 / -1 / -2
+// for high / normal / low) and a thread that started pinned to a single core runs one step lower;
+// KYTY_GUEST_PRIORITY_BAND=old keeps the old mapping (+2 / 0 / -2). Default since the A/B of
+// 2026-10-05 (passage, camera sweep, 3 rounds): 41.1 fps -> 44.1 with the GPU thread raised as well.
+// -1: not read yet; the live command `prio` changes it at run time (PthreadApplyGuestPriorityBand).
+static std::atomic<int> g_guest_band_low {-1};
+static bool GuestPriorityBandLow() {
+	int low = g_guest_band_low.load(std::memory_order_relaxed);
+	if (low < 0) {
+		const char* value = std::getenv("KYTY_GUEST_PRIORITY_BAND");
+		low               = value != nullptr && std::string_view(value) == "old" ? 0 : 1;
+		g_guest_band_low.store(low, std::memory_order_relaxed);
+	}
+	return low != 0;
+}
+
+static int GuestPriorityToHost(int guest_priority) {
+	const bool low = GuestPriorityBandLow();
+	if (guest_priority <= 478) return low ? 0 : +2;
+	if (guest_priority >= 733) return -2;
+	return low ? -1 : 0;
+}
+
+// A guest thread pinned to a single core owns it on the console; here it shares the cores with the
+// threads that produce its work. Decided once when the thread starts (a main thread pinning itself
+// to core 0 for a while must not drop with it).
+static bool LowerCoreBoundThread(KernelCpumask affinity) {
+	return GuestPriorityBandLow() && std::has_single_bit(affinity);
+}
+
+static int GuestThreadHostPriority(int guest_priority, bool core_bound) {
+	const int host = GuestPriorityToHost(guest_priority);
+	return core_bound ? std::max(host - 1, -2) : host;
+}
+#endif
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;
 static constexpr KernelClockid KERNEL_CLOCK_VIRTUAL           = 1;
@@ -376,8 +419,6 @@ struct PthreadAttrPrivate {
 	pthread_attr_t p;
 };
 
-struct PthreadCondPrivate;
-
 struct PthreadGuestData {
 	int32_t thread_id;
 	uint8_t reserved[4092];
@@ -397,11 +438,13 @@ struct PthreadPrivate {
 	std::atomic_bool      almost_done;
 	std::atomic_bool      free;
 	uint64_t              host_thread_id;
+	// Started pinned to one core: runs one host priority step lower (KYTY_GUEST_PRIORITY_BAND=low).
+	std::atomic_bool      core_bound = false;
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
 	uintptr_t             guest_host_rbp;
 	uint64_t              cond_sequence = 0;
-	PthreadCondPrivate*   waiting_cond  = nullptr;
+	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
@@ -456,8 +499,6 @@ struct PthreadCondPrivate {
 	uint8_t                 reserved[256];
 	std::string             name;
 	std::mutex              m;
-	std::condition_variable cv;
-	uint64_t                sequence = 0;
 	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
 	std::vector<Pthread>    waiters;
 };
@@ -466,77 +507,40 @@ static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
 
-	thread->waiting_cond = cond;
 	cond->waiters.push_back(thread);
 }
 
-static bool CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
+static void CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
 
-	auto it = std::find(cond->waiters.begin(), cond->waiters.end(), thread);
-	if (it == cond->waiters.end()) {
-		return false;
-	}
-
-	cond->waiters.erase(it);
-	if (thread->waiting_cond == cond) {
-		thread->waiting_cond = nullptr;
-	}
-	return true;
+	std::erase(cond->waiters, thread);
 }
 
-static bool CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
+static void CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 
 	if (thread == nullptr) {
 		if (cond->waiters.empty()) {
-			return false;
+			return;
 		}
 		thread = cond->waiters.front();
 	}
 
 	auto it = std::find(cond->waiters.begin(), cond->waiters.end(), thread);
 	if (it == cond->waiters.end()) {
-		return false;
+		return;
 	}
 
 	cond->waiters.erase(it);
-	if (thread->waiting_cond == cond) {
-		thread->waiting_cond = nullptr;
-	}
 	thread->cond_sequence++;
-	return true;
-}
-
-static void CondClearWaiters(PthreadCondPrivate* cond) {
-	EXIT_IF(cond == nullptr);
-
-	for (auto* thread: cond->waiters) {
-		if (thread != nullptr && thread->waiting_cond == cond) {
-			thread->waiting_cond = nullptr;
-		}
-	}
-	cond->waiters.clear();
+	// Notify while holding cond->m so the selected waiter cannot exit and be freed first.
+	thread->cond_cv.notify_one();
 }
 
 void PthreadWakeForSignal(Pthread thread) {
-	if (thread == nullptr) {
-		return;
-	}
-
-	auto* cond = thread->waiting_cond;
-	if (cond == nullptr) {
-		return;
-	}
-
-	bool notify = false;
-	{
-		std::lock_guard lock(cond->m);
-		notify = (thread->waiting_cond == cond);
-	}
-	if (notify) {
-		cond->cv.notify_all();
+	if (thread != nullptr) {
+		thread->cond_cv.notify_one();
 	}
 }
 
@@ -654,6 +658,13 @@ public:
 	Pthread Create();
 
 	void FreeDetachedThreads();
+
+	template <typename F>
+	void ForEachRunning(F&& fn) {
+		Common::LockGuard lock(m_mutex);
+		for (auto* p: m_threads)
+			if (!p->free && !p->almost_done && p->attr != nullptr) fn(p);
+	}
 
 private:
 	std::vector<Pthread> m_threads;
@@ -2525,13 +2536,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
-	if (param->sched_priority <= 478) {
-		pparam.sched_priority = +2;
-	} else if (param->sched_priority >= 733) {
-		pparam.sched_priority = -2;
-	} else {
-		pparam.sched_priority = 0;
-	}
+	pparam.sched_priority = GuestPriorityToHost(param->sched_priority);
 
 	if (pthread_attr_setschedparam(&attr_value->p, &pparam) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -3096,27 +3101,13 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		if (!(*cond)->waiters.empty()) {
-			(*cond)->sequence++;
-			CondClearWaiters(*cond);
-			notify = true;
-		}
+	std::lock_guard lock((*cond)->m);
+	for (auto* thread: (*cond)->waiters) {
+		thread->cond_sequence++;
+		thread->cond_cv.notify_one();
 	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond broadcast: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	(*cond)->waiters.clear();
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
@@ -3200,23 +3191,9 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		notify = CondWakeWaiter(*cond, nullptr);
-	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond signal: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	std::lock_guard lock((*cond)->m);
+	CondWakeWaiter(*cond, nullptr);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
@@ -3233,23 +3210,9 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
-	int  result = 0;
-	bool notify = false;
-	{
-		std::lock_guard lock((*cond)->m);
-		notify = CondWakeWaiter(*cond, thread);
-	}
-	if (notify) {
-		(*cond)->cv.notify_all();
-	}
-
-	// LOGF("\tcond signalto: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
-
-	if (result == 0) {
-		return OK;
-	}
-	return KERNEL_ERROR_EINVAL;
+	std::lock_guard lock((*cond)->m);
+	CondWakeWaiter(*cond, thread);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
@@ -3278,7 +3241,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3291,9 +3253,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
-	auto       ready    = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
@@ -3309,7 +3269,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 			                            ? remaining
 			                            : std::chrono::steady_clock::duration(
 			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			cond_value->cv.wait_for(cond_lock, poll);
+			thread->cond_cv.wait_for(cond_lock, poll);
 
 			if (!ready()) {
 				cond_lock.unlock();
@@ -3370,7 +3330,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3382,9 +3341,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	auto ready = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	while (!ready()) {
 		const auto now = std::chrono::steady_clock::now();
@@ -3397,7 +3354,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		                            ? remaining
 		                            : std::chrono::steady_clock::duration(
 		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		cond_value->cv.wait_for(cond_lock, poll);
+		thread->cond_cv.wait_for(cond_lock, poll);
 
 		if (!ready()) {
 			cond_lock.unlock();
@@ -3449,7 +3406,6 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
-	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
@@ -3461,12 +3417,10 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
-	auto ready = [cond_value, thread, sequence, thread_sequence] {
-		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
-	};
+	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
 	while (!ready()) {
-		cond_value->cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 		if (!ready()) {
 			cond_lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
@@ -3502,10 +3456,6 @@ Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	auto* previous = g_pthread_self;
 	g_pthread_self = thread;
 	return previous;
-}
-
-int PthreadGetUniqueId(Pthread thread) {
-	return thread != nullptr ? thread->unique_id : 0;
 }
 
 uint64_t PthreadGetHostThreadId(Pthread thread) {
@@ -3571,6 +3521,14 @@ int PthreadGetPriorityForKernel(Pthread thread) {
 	if (thread == nullptr) {
 		return 700;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// With the low band, host priority 0 means both "default" and "high": the class of the priority
+	// the guest asked for, whatever host step the thread runs at.
+	if (GuestPriorityBandLow() && thread->attr != nullptr) {
+		const int guest = thread->attr->guest_priority;
+		return guest <= 478 ? 256 : guest >= 733 ? 767 : 700;
+	}
+#endif
 
 	sched_param param {};
 	int         pol = 0;
@@ -3586,6 +3544,25 @@ int PthreadGetPriorityForKernel(Pthread thread) {
 		return 256;
 	}
 	return 700;
+}
+
+int PthreadApplyGuestPriorityBand(bool low) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	g_guest_band_low.store(low ? 1 : 0, std::memory_order_relaxed);
+	int applied = 0;
+	g_pthread_context->GetPthreadPool()->ForEachRunning([&](Pthread thread) {
+		thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);
+		sched_param param {};
+		int         pol = 0;
+		if (pthread_getschedparam(thread->p, &pol, &param) != 0) return;
+		param.sched_priority = GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound);
+		if (pthread_setschedparam(thread->p, pol, &param) == 0) applied++;
+	});
+	return applied;
+#else
+	(void)low;
+	return 0;
+#endif
 }
 
 int PthreadGetCurrentPriorityForKernel() {
@@ -3650,6 +3627,15 @@ static void* RunThread(void* arg) {
 		            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(thread->attr->stack_addr)),
 		            static_cast<unsigned long long>(thread->attr->stack_size),
 		            thread->attr->stack_user ? "(the game's, no guard)" : "(guarded)");
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The guest priority applied to this thread directly (winpthreads may not honour the attribute
+	// at creation: PthreadAttrSetinheritsched keeps inherit_sched out of the native attribute).
+	if (GuestPriorityBandLow() && thread->attr != nullptr) {
+		thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);
+		SetThreadPriority(GetCurrentThread(), GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+	}
+#endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
@@ -3937,13 +3923,7 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (prio <= 478) {
-		param.sched_priority = +2;
-	} else if (prio >= 733) {
-		param.sched_priority = -2;
-	} else {
-		param.sched_priority = 0;
-	}
+	param.sched_priority = GuestThreadHostPriority(prio, thread->core_bound);
 
 	if (pthread_setschedparam(thread->p, pol, &param) != 0) {
 		return KERNEL_ERROR_EINVAL;

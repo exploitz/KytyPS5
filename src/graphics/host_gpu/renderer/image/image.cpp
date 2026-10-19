@@ -836,7 +836,7 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info, bool host_memory)
     : serial(g_image_serial_next.fetch_add(1, std::memory_order_relaxed)), info(image_info),
       m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
@@ -871,11 +871,13 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
+	if (!graphics.CreateImage(create, backing, host_memory)) {
+		if (host_memory) return; // (no backing: TextureCache::DemoteImage deletes it)
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+	this->host_memory = backing.host_memory;
 }
 
 void Image::PrepareReuse(const ImageInfo& image_info) {

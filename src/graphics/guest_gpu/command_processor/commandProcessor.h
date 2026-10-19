@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <utility>
 #include <span>
 #include <vector>
 
@@ -134,6 +135,9 @@ public:
 	void FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action, void* dst_gpu_addr,
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
+	// A flip the game requested from the GPU (an end-of-pipe flip packet) was processed since the
+	// last call: the frame boundary the resource collectors run at (GuestGpu::ProcessSubmission).
+	[[nodiscard]] bool TakeGpuFlipSeen() noexcept { return std::exchange(m_gpu_flip_seen, false); }
 	void SynchronizeGpu();
 	void EmitGlobalBarrier();
 	void BreakComputeChain();
@@ -216,6 +220,7 @@ private:
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
 	bool     m_ce_complete = false;
+	bool     m_gpu_flip_seen = false;
 
 	uint32_t m_const_ram[0x3000] = {0};
 	// The dwords [0, m_const_ram_used) may be nonzero: a reset clears only them (all 48 KiB at every DispatchReset).

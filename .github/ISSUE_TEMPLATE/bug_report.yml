@@ -1,0 +1,73 @@
+name: Problem report
+description: Something went wrong running Demon's Souls with this build (a crash, black screen, broken graphics, low fps).
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. The fastest way to a fix: in the launcher, click **Report a problem**. It saves
+        `KytyPS5-report-<date>.zip` to your Desktop (logs and a summary of your PC; your Windows user name is
+        left out of its folder paths). Attach that zip below.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected and what you saw. Where in the game (area, boss, menu)?
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Report zip
+      description: Drag the KytyPS5-report zip from your Desktop here. Without the launcher, attach the newest files of the logs folder.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Release
+      description: The version shown in the launcher under Help (for example v1.0.0-beta.1).
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: Processor (CPU)
+      placeholder: e.g. AMD Ryzen 7 5800X3D
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card and driver version
+      placeholder: e.g. AMD Radeon RX 7800 XT, Adrenalin 25.9.1
+    validations:
+      required: true
+  - type: input
+    id: ram
+    attributes:
+      label: RAM and Windows version
+      placeholder: e.g. 32 GB, Windows 11 24H2
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game version
+      options:
+        - PPSA01341 01.007.000 (1.07)
+        - PPSA01341 01.005.000 (1.05)
+        - Other (say which in the description)
+    validations:
+      required: true
+  - type: dropdown
+    id: precompile
+    attributes:
+      label: Shader precompile
+      options:
+        - Finished
+        - Started but not finished
+        - Not run
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings (if you changed any)
+      description: Output, Graphics detail, Anti-aliasing, Frame generation, VSync, HDR...

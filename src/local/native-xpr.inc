@@ -59,6 +59,9 @@ extern "C" {
 // N > 2: records stay N frames unused (2 before: a turn of the camera dropped every record behind it, and
 // turning back stored them all again within the store budget, thousands of normal draws a frame for seconds).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_keep_frames {0};
+// Frames between sweeps of the unused records (NativeXprCollect; KYTY_NATIVE_XPR_SWEEP_FRAMES). 8 vs 64 at 1-1 standing
+// (same process, uncapped, 3 settled rounds): no difference (49.5 vs 49.6 fps), so chen's 8 stays.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_native_xpr_sweep_frames {8};
 // 1: a relocated key holds the object's descriptor bases (read through the draw's pointers) before its use in
 // the frame: the instances of one mesh keep their records when the frame draws them in another order (a culled
 // instance shifted every later use onto another instance's record, which rebound its descriptors).
@@ -1063,11 +1066,16 @@ void RenderExecutor::NativeXprCollect() {
 	if (!m_native_xpr) return;
 	auto&      cache = *m_native_xpr;
 	const auto frame = m_context.FrameNumber();
-	if (frame - cache.swept_frame >= 8) {
-		// Every eighth frame, records no draw used for `keep` frames leave (their
-		// objects are gone or their keys changed); a pair whose records keep
-		// leaving unused stops storing. Past the soft cap only the last two frames' stay
-		// (at the hard cap NativeXprStore drops them all).
+	// Every KYTY_NATIVE_XPR_SWEEP_FRAMES frames (8; every eighth past the soft cap whatever the switch, where room must be
+	// made before the hard cap's reset): the walk over ~50K records (map nodes and records all cold) is ~3% of the
+	// render thread standing at Stonefang (7.8% at Latria), +0.8 ms on every eighth frame; 64 measured no fps gain at 1-1.
+	const uint64_t sweep_every = cache.records.size() > NativeXprCache::RecordsSoftCap
+	                                 ? 8
+	                                 : std::max(1u, kyty_local_native_xpr_sweep_frames.load(std::memory_order_relaxed));
+	if (frame - cache.swept_frame >= sweep_every) {
+		// Records no draw used for `keep` frames leave (their objects are gone or their keys changed); a pair whose
+		// records keep leaving unused stops storing. Past the soft cap only the last two frames' stay (at the hard cap
+		// NativeXprStore drops them all).
 		cache.swept_frame = frame;
 		const uint64_t keep = cache.records.size() > NativeXprCache::RecordsSoftCap
 		                          ? 2

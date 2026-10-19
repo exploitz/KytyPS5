@@ -31,7 +31,9 @@
 #include "frame-capture.h"
 #include "hud-anchor.h"
 #include "live-control.h"
+#include "local-platform.h"
 #include "performance-switches.h"
+#include "causal-probe.h"
 #include "speculation-state.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -39,6 +41,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -62,6 +65,14 @@ extern "C" {
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode {0};
 // 1: a full barrier with no recorded work since the previous one is skipped.
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_global_barrier_dedupe {0};
+// Collection on GPU flips (live, for an A/B): 0 chen's ca61c070, the collectors at the end of the flip's submission
+// (GpuResourceManager::NoteGpuFlip); 1 ours since 2026-10-04, AdvanceFrame as the flip is translated (the texture
+// cache's frame advancing with it).
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_gc_flip_hook {0};
+// Causal probe (causal-probe.h): the site, the delay per hit in ns, and the site's hits.
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_probe_site {0};
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_probe_ns {0};
+[[gnu::used]] volatile std::atomic_uint64_t kyty_local_probe_hits {0};
 }
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
@@ -124,6 +135,14 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 
 GuestGpu::~GuestGpu() {
 	Shutdown();
+}
+
+// A flip from the GPU (Demon's Souls in play). Collection never reached GPU flips after 81cd3118; ours ran it here from
+// 2026-10-04, chen's ca61c070 at the end of the flip's submission (GpuResourceManager::NoteGpuFlip). One of the two
+// runs, per kyty_local_gc_flip_hook.
+void GuestGpu::AdvanceFrameAfterGpuFlip() {
+	CausalProbe::At(CausalProbe::Flip);
+	if (kyty_local_gc_flip_hook.load(std::memory_order_relaxed) == 1) m_renderer.GetGpuResources().AdvanceFrame();
 }
 
 void GuestGpu::Shutdown() {
@@ -284,6 +303,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	if (draw_commands.empty()) {
 		return;
 	}
+	CausalProbe::At(CausalProbe::GuestSubmit);
 	GpuMutexLock lock(m_submission_mutex);
 	Submission   submission;
 	submission.type              = SubmissionType::Graphics;
@@ -1027,6 +1047,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
+			CausalProbe::At(CausalProbe::GraphicsSlice);
 			bool progressed = false;
 			// (The speculation's report: the graphics queue's time while it is on.)
 			struct QueueTime {
@@ -1158,14 +1179,17 @@ bool GuestGpu::Process(Submission& submission) {
 			if (progressed) {
 				if (complete) {
 					m_renderer.GetGpuResources().EndSubmission();
+					if (cp.TakeGpuFlipSeen()) AdvanceFrameAfterGpuFlip();
 				}
 				cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.GetGpuResources().EndSubmission();
+				if (cp.TakeGpuFlipSeen()) AdvanceFrameAfterGpuFlip();
 			}
 			break;
 		}
 		case SubmissionType::Compute: {
+			CausalProbe::At(CausalProbe::ComputeSlice);
 			const auto      num_dw = static_cast<uint32_t>(submission.commands.size());
 			const auto*     buffer = submission.commands.data();
 			static uint32_t compute_batch_log_count = 0;
@@ -2154,6 +2178,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			                                                      mode, *record);
 		return;
 	}
+	CausalProbe::At(IsAsyncComputeQueue() ? CausalProbe::ComputeDispatch : CausalProbe::GraphicsDispatch);
 
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
@@ -2713,6 +2738,7 @@ void CommandProcessor::Flip() {
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
 	GetScheduler().Flush();
+	m_gpu_flip_seen = true;
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
@@ -2734,6 +2760,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
 	GetScheduler().Flush();
+	m_gpu_flip_seen = true;
 }
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
@@ -2761,6 +2788,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
 	GetScheduler().Flush();
+	m_gpu_flip_seen = true;
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {

@@ -110,7 +110,6 @@ int KYTY_SYSV_ABI     PthreadRename(Pthread thread, const char* name);
 void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
-int                   PthreadGetUniqueId(Pthread thread);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
@@ -130,6 +129,9 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 bool PthreadKillHost(Pthread thread, int host_signal);
 #endif
 int PthreadGetPriorityForKernel(Pthread thread);
+// The guest priority band (KYTY_GUEST_PRIORITY_BAND) changed at run time and applied to every running
+// guest thread (live command `prio`); the number of threads re-prioritized.
+int PthreadApplyGuestPriorityBand(bool low);
 int PthreadGetCurrentPriorityForKernel();
 
 int KYTY_SYSV_ABI          KernelUsleep(KernelUseconds microseconds);

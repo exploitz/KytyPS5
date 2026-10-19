@@ -68,6 +68,11 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	for (uint32_t round = 1;; ++round) {
 		const auto result = m_graphics.device.waitSemaphores(&wait_info, StallSeconds * 1000000000ull);
 		if (result == vk::Result::eSuccess) break;
+		if (result != vk::Result::eTimeout) {
+			std::printf("MasterSemaphore: vkWaitSemaphores(tick %llu) failed: %s\n", static_cast<unsigned long long>(tick),
+			            vk::to_string(result).c_str());
+			std::fflush(stdout);
+		}
 		if (result == vk::Result::eErrorDeviceLost) {
 			// (A diagnostic's state too: what the GPU was in when it was reset, if it still reads.)
 			if (const auto dump = DeviceFault::g_stall_dump.load(std::memory_order_acquire); dump != nullptr) {

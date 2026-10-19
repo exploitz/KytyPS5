@@ -178,6 +178,11 @@ const FormatInfo* FindFormatInfo(BufferFormat format) {
 
 } // namespace
 
+// The format table has an entry for the value (false for the gaps in the encoding, 137..155 e.g.).
+bool IsDefinedBufferFormat(BufferFormat format) {
+	return FindFormatInfo(format) != nullptr;
+}
+
 RenderTargetFormatEncoding ResolveRenderTargetFormat(ChannelLayout layout, ChannelType type) {
 	const auto* layout_info = FindRenderTargetLayout(layout);
 	const auto  raw_type    = static_cast<uint32_t>(type);

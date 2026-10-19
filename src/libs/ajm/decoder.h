@@ -165,4 +165,7 @@ protected:
 	uint64_t          m_total_decoded_samples = 0;
 };
 
+// DIAGNOSTIC: the last decode jobs (any result), for crash reports.
+void AjmDumpRecentJobs();
+
 } // namespace Libs::Audio::Ajm
