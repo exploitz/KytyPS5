@@ -266,15 +266,70 @@ public static bool High(IntPtr process) {
 	return SetProcessInformation(process, 4, ref state, (uint)Marshal.SizeOf(state));
 }
 '@
-function Start-Precompile([string]$name, [string[]]$arguments) {
+# The tag is not enough for a precompile started from a hidden console (a background shell, WSL; a 12900K, 10-19):
+# eight shards on its 8 E-cores at 100%, the 16 P-core threads idle, at normal priority too, until each process was
+# given one kind of core's CPUs alone. So on a CPU with cores of more than one efficiency class, every process gets one
+# class's CPUs: the shards spread over the classes by their CPU counts, the single steps (plans, merges) on the
+# fastest class.
+Add-Type -Namespace KytyPrecompile -Name Cores -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)] static extern bool GetLogicalProcessorInformationEx(int relation, IntPtr buffer, ref uint length);
+// Group 0's logical CPUs by the efficiency class of their core (RelationProcessorCore), the most efficient class last.
+public static long[] ByEfficiencyClass() {
+	uint length = 0;
+	GetLogicalProcessorInformationEx(0, IntPtr.Zero, ref length);
+	if (length == 0) return new long[0];
+	var buffer = Marshal.AllocHGlobal((int)length);
+	try {
+		if (!GetLogicalProcessorInformationEx(0, buffer, ref length)) return new long[0];
+		var classes = new System.Collections.Generic.SortedDictionary<int, long>();
+		for (uint offset = 0; offset < length;) {
+			var entry = new IntPtr(buffer.ToInt64() + offset);
+			// SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX: Relationship, Size, then PROCESSOR_RELATIONSHIP: Flags (8),
+			// EfficiencyClass (9), Reserved[20], GroupCount (30), GROUP_AFFINITY GroupMask[] from 32 (Mask, Group: 16 bytes each).
+			uint size       = (uint)Marshal.ReadInt32(entry, 4);
+			int  efficiency = Marshal.ReadByte(entry, 9);
+			int  groups     = Marshal.ReadInt16(entry, 30);
+			for (int g = 0; g < groups; g++) {
+				if (Marshal.ReadInt16(entry, 32 + 16 * g + 8) != 0) continue;
+				long cpus;
+				classes.TryGetValue(efficiency, out cpus);
+				classes[efficiency] = cpus | Marshal.ReadInt64(entry, 32 + 16 * g);
+			}
+			if (size == 0) break;
+			offset += size;
+		}
+		var result = new long[classes.Count];
+		int i = classes.Count;
+		foreach (var pair in classes) result[--i] = pair.Value; // (the highest class, the performance cores, first)
+		return result;
+	} finally { Marshal.FreeHGlobal(buffer); }
+}
+'@
+function Get-CpuCount([int64]$cpus) { $n = 0; for ($bit = 0; $bit -lt 64; $bit++) { if ($cpus -band ([int64]1 -shl $bit)) { $n++ } }; $n }
+$coreClasses = @([KytyPrecompile.Cores]::ByEfficiencyClass() | ForEach-Object { $_ -band $mask } | Where-Object { $_ -ne 0 })
+if ($coreClasses.Count -lt 2) { $coreClasses = @($mask) }
+# The core class with the fewest running shards for its CPUs.
+function Get-ShardCpus {
+	$best = $coreClasses[0]
+	$bestLoad = [double]::MaxValue
+	foreach ($cpus in $coreClasses) {
+		$count = @($running.Values | Where-Object { $_[2].CpuMask -eq $cpus }).Count
+		$load = ($count + 1) / (Get-CpuCount $cpus)
+		if ($load -lt $bestLoad) { $best = $cpus; $bestLoad = $load }
+	}
+	$best
+}
+function Start-Precompile([string]$name, [string[]]$arguments, [int64]$cpus = 0) {
+	if ($cpus -eq 0) { $cpus = $coreClasses[0] }
 	$env:__GL_SHADER_DISK_CACHE_PATH = Join-Path $nvidiaCaches $name
 	New-Item -ItemType Directory -Force $env:__GL_SHADER_DISK_CACHE_PATH | Out-Null
 	$process = Start-Process -FilePath $Exe -ArgumentList (@('--game', "`"$Game`"") + $arguments) -NoNewWindow -PassThru `
 		-WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logs\$name.out.log" -RedirectStandardError "$logs\$name.err.log"
 	$process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
-	$process.ProcessorAffinity = [IntPtr]$mask
+	$process.ProcessorAffinity = [IntPtr]$cpus
 	$null = [KytyPrecompile.Qos]::High($process.Handle) # also keeps the exit code readable after the process ends
-	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru
+	$process | Add-Member NoteProperty NvidiaCache $env:__GL_SHADER_DISK_CACHE_PATH -PassThru |
+		Add-Member NoteProperty CpuMask $cpus -PassThru
 }
 function Remove-NvidiaCache($process) { Remove-Item -Recurse -Force $process.NvidiaCache -ErrorAction SilentlyContinue }
 function Wait-Precompile($process, [string]$what) {
@@ -283,7 +338,7 @@ function Wait-Precompile($process, [string]$what) {
 	if ($process.ExitCode -ne 0) { throw "$what failed; logs: $logName" }
 }
 
-Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time, affinity 0x$('{0:X}' -f $mask); logs $logName"
+Write-Host "precompile: $Seeds, $Shards shards, $Jobs at a time, affinity 0x$('{0:X}' -f $mask) (core classes: $(($coreClasses | ForEach-Object { '0x{0:X}' -f $_ }) -join ', ')); logs $logName"
 Write-Host "recorded:   $(if ($Recorded) { "$Recorded (the release's hints and this PC's recorded play)" } else { 'none: the seeds alone' })"
 try {
 if ($Coverage) {
@@ -363,7 +418,7 @@ while ($first.Count -or $second.Count -or $running.Count) {
 		$seedFile, $shard = $pending.Dequeue()
 		$name = 'shard' + ($shard -replace '/', 'of') + '-' + [IO.Path]::GetFileNameWithoutExtension($seedFile)
 		$running[$name] = @($seedFile, $shard, (Start-Precompile $name @('--seeds', "`"$seedFile`"", '--shard', $shard,
-			'--threads', "$Threads", '--plan', "`"$plan`"")))
+			'--threads', "$Threads", '--plan', "`"$plan`"") (Get-ShardCpus)))
 	}
 	Start-Sleep -Milliseconds 250
 	foreach ($name in @($running.Keys)) {
