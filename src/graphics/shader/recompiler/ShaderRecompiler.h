@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/ir/passes/ExecDemand.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
@@ -21,6 +22,7 @@ struct CompileOptions {
 	bool                        early_dump                 = false;
 	bool                        enable_lod_stats           = false;
 	bool                        table_mode                 = false; // IR::EnterTableMode
+	bool                        exec_demand                = IR::ExecDemandEnabled(); // IR::EliminateMaskedSelects
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

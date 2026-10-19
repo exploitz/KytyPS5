@@ -38,4 +38,29 @@ if(GIT_EXECUTABLE)
 		endif()
 	endif()
 endif()
+# Hash of everything that can change what the shader recompiler produces (upstream PR #988): it keys
+# the translations kept on disk, so editing the recompiler invalidates them while other changes do not.
+file(GLOB_RECURSE RECOMPILER_SOURCES
+	"${GIT_WORKING_DIRECTORY}/src/graphics/shader/*.h"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/shader/*.cpp"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/shader/*.inc"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/guest_gpu/gpu_format.h"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/guest_gpu/gpu_format.cpp"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/guest_gpu/gpu_defs.h"
+	"${GIT_WORKING_DIRECTORY}/src/local/native-preparation-*.h"
+	"${GIT_WORKING_DIRECTORY}/src/local/native-resource-*.h"
+	"${GIT_WORKING_DIRECTORY}/src/local/SrtAotAbi.h"
+	"${GIT_WORKING_DIRECTORY}/src/local/shader-warmup-cache.h"
+)
+list(SORT RECOMPILER_SOURCES)
+set(RECOMPILER_COMBINED_HASH "")
+foreach(src ${RECOMPILER_SOURCES})
+	file(SHA256 "${src}" SRC_HASH)
+	string(APPEND RECOMPILER_COMBINED_HASH "${SRC_HASH}")
+endforeach()
+if(RECOMPILER_COMBINED_HASH STREQUAL "")
+	set(KYTY_RECOMPILER_SIGNATURE "none")
+else()
+	string(SHA256 KYTY_RECOMPILER_SIGNATURE "${RECOMPILER_COMBINED_HASH}")
+endif()
 configure_file("${INPUT_FILE}" "${OUTPUT_FILE}")

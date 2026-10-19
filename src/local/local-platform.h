@@ -65,6 +65,10 @@ bool FlushProcessWriteBuffers();
 // below-normal priority too: background work that must not hold up the game's threads.
 void AvoidCpuList(const char* avoid_cpus);
 void MakeBackgroundThread(const char* avoid_cpus);
+// The calling thread one priority level above normal work (Windows: THREAD_PRIORITY_HIGHEST).
+bool RaiseThreadPriority();
+// Another thread's priority by handle (CurrentThreadHandle): Windows THREAD_PRIORITY_* values (0 normal, 2 highest).
+bool SetThreadHandlePriority(uint64_t handle, int priority);
 // The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
 // unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
 void MakeCriticalThread();
@@ -88,6 +92,13 @@ bool     ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size
 void     CloseScratchFile(uint64_t file);
 // An existing file (a UTF-8 path) for ReadScratchFile and CloseScratchFile; 0 when it cannot be opened.
 uint64_t OpenFileForReading(const char* path);
+// A file kept between runs (a UTF-8 path) for WriteScratchFile, ReadScratchFile and CloseScratchFile,
+// made when missing, emptied first with `truncate`; 0 when it cannot be opened.
+uint64_t OpenFileForWriting(const char* path, bool truncate);
+// The size of a file one of the above opened (0 on failure).
+uint64_t FileSize(uint64_t file);
+// Cuts a file OpenFileForWriting opened to `size` bytes.
+bool TruncateFile(uint64_t file, uint64_t size);
 
 // The process's committed private memory and resident working set, and the machine's physical memory, in
 // bytes (0 where the host cannot tell; KYTY_SIMULATE_RAM_MB=<n> reports n MiB of physical memory, for tests).
@@ -107,6 +118,10 @@ void LogAddressSpace(const char* label, uint64_t begin, uint64_t end);
 // module+offset, zero, data) and the committed private allocations (<path>.vm.tsv, the heaps' marked); false where
 // the host cannot list them.
 bool WriteHeapHistogram(const char* path);
+// Diagnostics: the process's address space by kind ("kind<TAB>committed MiB<TAB>resident MiB<TAB>regions<TAB>name"
+// lines to `path`: private, mapped files and modules, each file and module, the largest private allocations) and a
+// summary line on the console; false where the host cannot walk it.
+bool WriteAddressSpaceCensus(const char* path);
 // Diagnostics: the stacks of live heap blocks of the given sizes ("2848,5151,16-256"): StartAllocTrace hooks the process
 // heap calls of every loaded module (their imports of RtlAllocateHeap/RtlFreeHeap/RtlReAllocateHeap) and records each
 // such block from then on; WriteAllocTrace writes the live ones by stack ("count<TAB>bytes<TAB>size<TAB>frames" lines,
@@ -121,6 +136,9 @@ bool OpenVideoMemoryAdapter(const uint8_t* luid);
 bool QueryVideoMemory(uint64_t* usage, uint64_t* budget);
 // The process's system memory the GPU uses (Task Manager's shared GPU memory).
 bool QuerySharedGpuMemory(uint64_t* usage);
+// The whole card's video memory in use, all processes' (Task Manager's dedicated GPU memory of the GPU), sampled once a
+// second after OpenVideoMemoryAdapter; false while there is no sample younger than 5 s (other systems: always).
+bool QueryAdapterVideoMemory(uint64_t* in_use);
 
 // The file's Authenticode signature is valid (no network: revocation not checked) and its signer is NVIDIA
 // Corporation: NVIDIA's DLLs the emulator loads (Streamline for frame generation, DLSS). false elsewhere.

@@ -25,6 +25,9 @@
 #endif
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <cwchar>
 #include <psapi.h>
 #include <softpub.h>
 #include <tlhelp32.h>
@@ -47,6 +50,7 @@
 #include <sched.h>
 #include <string>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -54,14 +58,22 @@
 namespace LocalPlatform {
 
 // "1,2,3" -> bit mask of CPUs 0..63; 0 for an empty or invalid list.
+// "1,2,3,6,7", and ranges: "0-15,20" (a lone "0-15" used to read as CPU 0: the game on one core).
 static uint64_t CpuListMask(const char* list) {
 	uint64_t mask = 0;
 	if (list == nullptr) return 0;
 	for (const char* p = list; *p != '\0';) {
-		char*      end = nullptr;
-		const long cpu = std::strtol(p, &end, 10);
+		char*      end   = nullptr;
+		const long first = std::strtol(p, &end, 10);
 		if (end == p) break;
-		if (cpu >= 0 && cpu < 64) mask |= uint64_t(1) << cpu;
+		long last = first;
+		if (*end == '-') {
+			char* range_end = nullptr;
+			last            = std::strtol(end + 1, &range_end, 10);
+			if (range_end == end + 1) break;
+			end = range_end;
+		}
+		for (long cpu = std::max(first, 0L); cpu <= last && cpu < 64; ++cpu) mask |= uint64_t(1) << cpu;
 		p = (*end == ',') ? end + 1 : end;
 	}
 	return mask;
@@ -164,15 +176,14 @@ bool PinThreadHandleToCpuList(uint64_t handle, const char* list) {
 	       SetThreadAffinityMask(reinterpret_cast<HANDLE>(handle), DWORD_PTR(mask)) != 0;
 }
 
-// CPU set ids of the logical processors in the mask (all of them for mask 0 = no restriction).
-static bool SetProcessDefaultCpuMask(uint64_t mask) {
-	if (mask == 0) return SetProcessDefaultCpuSets(GetCurrentProcess(), nullptr, 0) != 0;
-	ULONG length = 0;
+// CPU set ids of the logical processors in the mask.
+static std::vector<ULONG> CpuSetIds(uint64_t mask) {
+	std::vector<ULONG> ids;
+	ULONG              length = 0;
 	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
 	std::vector<uint8_t> buffer(length);
 	auto* first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
-	if (length == 0 || !GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) return false;
-	std::vector<ULONG> ids;
+	if (length == 0 || !GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) return ids;
 	for (ULONG offset = 0; offset < length;) {
 		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
 		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64 &&
@@ -180,6 +191,13 @@ static bool SetProcessDefaultCpuMask(uint64_t mask) {
 			ids.push_back(info->CpuSet.Id);
 		offset += info->Size;
 	}
+	return ids;
+}
+
+// The default CPU sets of the process's threads (all of them for mask 0 = no restriction).
+static bool SetProcessDefaultCpuMask(uint64_t mask) {
+	if (mask == 0) return SetProcessDefaultCpuSets(GetCurrentProcess(), nullptr, 0) != 0;
+	const auto ids = CpuSetIds(mask);
 	return !ids.empty() && SetProcessDefaultCpuSets(GetCurrentProcess(), ids.data(), static_cast<ULONG>(ids.size())) != 0;
 }
 
@@ -802,11 +820,34 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high) {
 	return stack_high > stack_low;
 }
 
+bool RaiseThreadPriority() {
+	return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+}
+
+bool SetThreadHandlePriority(uint64_t handle, int priority) {
+	return handle != 0 && SetThreadPriority(reinterpret_cast<HANDLE>(handle), priority) != 0;
+}
+
 void AvoidCpuList(const char* avoid_cpus) {
 	DWORD_PTR process = 0, system = 0;
-	if (const auto avoid = static_cast<DWORD_PTR>(CpuListMask(avoid_cpus));
-	    avoid != 0 && GetProcessAffinityMask(GetCurrentProcess(), &process, &system) != 0 && (process & ~avoid) != 0)
-		(void)SetThreadAffinityMask(GetCurrentThread(), process & ~avoid);
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) return;
+	// KYTY_BACKGROUND_CPUS (e.g. the E-cores "16-23"): where background work goes when the process
+	// may run there; these threads also leave the process's default CPU sets (KYTY_PROCESS_CPUS, the
+	// game's cores) for their own.
+	static const uint64_t background = [] {
+		const char* list = std::getenv("KYTY_BACKGROUND_CPUS");
+		return list != nullptr ? CpuListMask(list) : uint64_t {0};
+	}();
+	uint64_t mask = 0;
+	if (background != 0 && (process & background) != 0) {
+		mask = process & background;
+	} else if (const auto avoid = static_cast<DWORD_PTR>(CpuListMask(avoid_cpus)); avoid != 0 && (process & ~avoid) != 0) {
+		mask = process & ~avoid;
+	}
+	if (mask == 0) return;
+	(void)SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask));
+	if (const auto ids = CpuSetIds(mask); !ids.empty())
+		(void)SetThreadSelectedCpuSets(GetCurrentThread(), ids.data(), static_cast<ULONG>(ids.size()));
 }
 
 void MakeBackgroundThread(const char* avoid_cpus) {
@@ -997,6 +1038,27 @@ uint64_t OpenFileForReading(const char* path) {
 	HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
 	                          FILE_FLAG_RANDOM_ACCESS, nullptr);
 	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
+}
+
+uint64_t OpenFileForWriting(const char* path, bool truncate) {
+	wchar_t wide[MAX_PATH * 2] {};
+	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
+	HANDLE file = CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+	                          truncate ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_FLAG_RANDOM_ACCESS, nullptr);
+	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
+}
+
+bool TruncateFile(uint64_t file, uint64_t size) {
+	LARGE_INTEGER at {};
+	at.QuadPart = static_cast<LONGLONG>(size);
+	return file != 0 && SetFilePointerEx(reinterpret_cast<HANDLE>(file), at, nullptr, FILE_BEGIN) != 0 &&
+	       SetEndOfFile(reinterpret_cast<HANDLE>(file)) != 0;
+}
+
+uint64_t FileSize(uint64_t file) {
+	LARGE_INTEGER size {};
+	return file != 0 && GetFileSizeEx(reinterpret_cast<HANDLE>(file), &size) != 0 ? static_cast<uint64_t>(size.QuadPart)
+	                                                                               : 0;
 }
 
 bool WriteHeapHistogram(const char* path) {
@@ -1461,6 +1523,107 @@ bool WriteAllocTrace(const char* path) {
 	return true;
 }
 
+// The process's address space walked with VirtualQuery; the resident bytes are estimated from one page of every 64 KiB
+// (QueryWorkingSetEx), so a region's resident figure is within a few percent of the truth.
+bool WriteAddressSpaceCensus(const char* path) {
+	FILE* file = std::fopen(path, "w");
+	if (file == nullptr) return false;
+	struct Sum {
+		uint64_t committed = 0, resident = 0, regions = 0;
+	};
+	std::map<std::wstring, Sum> mapped, images;
+	std::map<uint64_t, Sum>     allocations; // committed private memory by allocation base
+	Sum                         private_sum, mapped_sum, image_sum;
+	uint64_t                    reserved = 0, guard = 0, no_access = 0;
+	constexpr uint64_t          Stride = 64 * 1024;
+	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> samples;
+	std::vector<std::pair<MEMORY_BASIC_INFORMATION, size_t>> regions; // (the region, its first sample)
+	MEMORY_BASIC_INFORMATION info {};
+	for (uint8_t* at = nullptr; VirtualQuery(at, &info, sizeof(info)) == sizeof(info);
+	     at = static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize) {
+		if (info.State == MEM_FREE) continue;
+		if (info.State == MEM_RESERVE) {
+			reserved += info.RegionSize;
+			continue;
+		}
+		if ((info.Protect & PAGE_GUARD) != 0) guard += info.RegionSize;
+		if (info.Protect == PAGE_NOACCESS) no_access += info.RegionSize;
+		regions.emplace_back(info, samples.size());
+		for (uint64_t offset = 0; offset < info.RegionSize; offset += Stride) {
+			PSAPI_WORKING_SET_EX_INFORMATION sample {};
+			sample.VirtualAddress = static_cast<uint8_t*>(info.BaseAddress) + offset;
+			samples.push_back(sample);
+		}
+	}
+	if (!samples.empty()) {
+		// (In parts: the call's buffer is limited.)
+		constexpr size_t Part = 65536;
+		for (size_t i = 0; i < samples.size(); i += Part) {
+			const auto count = std::min(Part, samples.size() - i);
+			K32QueryWorkingSetEx(GetCurrentProcess(), &samples[i], static_cast<DWORD>(count * sizeof(samples[0])));
+		}
+	}
+	for (const auto& [region, first]: regions) {
+		uint64_t resident = 0;
+		const auto count  = (region.RegionSize + Stride - 1) / Stride;
+		for (size_t i = 0; i < count; i++)
+			if (samples[first + i].VirtualAttributes.Valid) resident += std::min<uint64_t>(Stride, region.RegionSize - i * Stride);
+		const auto add = [&](Sum& sum) {
+			sum.committed += region.RegionSize;
+			sum.resident += resident;
+			sum.regions++;
+		};
+		if (region.Type == MEM_PRIVATE) {
+			add(private_sum);
+			add(allocations[reinterpret_cast<uint64_t>(region.AllocationBase)]);
+		} else {
+			wchar_t name[MAX_PATH] = L"?";
+			if (K32GetMappedFileNameW(GetCurrentProcess(), region.BaseAddress, name, MAX_PATH) == 0) {
+				name[0] = L'?';
+				name[1] = 0;
+			}
+			add(region.Type == MEM_IMAGE ? image_sum : mapped_sum);
+			add((region.Type == MEM_IMAGE ? images : mapped)[name]);
+		}
+	}
+	const auto memory = ProcessMemory();
+	const auto mib    = [](uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
+	std::fprintf(file, "kind\tcommitted_mib\tresident_mib\tregions\tname\n");
+	std::fprintf(file, "process\t%llu\t%llu\t0\tprivate bytes / working set\n", mib(memory.private_bytes), mib(memory.working_set));
+	std::fprintf(file, "private\t%llu\t%llu\t%llu\t(guard %llu, no access %llu; reserved only %llu)\n", mib(private_sum.committed),
+	             mib(private_sum.resident), static_cast<unsigned long long>(private_sum.regions), mib(guard), mib(no_access),
+	             mib(reserved));
+	std::fprintf(file, "mapped\t%llu\t%llu\t%llu\tall files\n", mib(mapped_sum.committed), mib(mapped_sum.resident),
+	             static_cast<unsigned long long>(mapped_sum.regions));
+	std::fprintf(file, "image\t%llu\t%llu\t%llu\tall modules\n", mib(image_sum.committed), mib(image_sum.resident),
+	             static_cast<unsigned long long>(image_sum.regions));
+	const auto write_named = [&](const char* kind, const std::map<std::wstring, Sum>& sums) {
+		std::vector<std::pair<std::wstring, Sum>> sorted(sums.begin(), sums.end());
+		std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.committed > b.second.committed; });
+		for (const auto& [name, sum]: sorted) {
+			if (sum.committed < (1u << 20u)) break;
+			std::fprintf(file, "%s\t%llu\t%llu\t%llu\t%ls\n", kind, mib(sum.committed), mib(sum.resident),
+			             static_cast<unsigned long long>(sum.regions), name.c_str());
+		}
+	};
+	write_named("mapped-file", mapped);
+	write_named("image-module", images);
+	std::vector<std::pair<uint64_t, Sum>> sorted(allocations.begin(), allocations.end());
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.committed > b.second.committed; });
+	size_t written = 0;
+	for (const auto& [base, sum]: sorted) {
+		if (written++ == 48 || sum.committed < (4u << 20u)) break;
+		std::fprintf(file, "allocation\t%llu\t%llu\t%llu\t0x%llx\n", mib(sum.committed), mib(sum.resident),
+		             static_cast<unsigned long long>(sum.regions), static_cast<unsigned long long>(base));
+	}
+	std::fclose(file);
+	std::printf("Address space: private %llu MiB committed (%llu resident), mapped files %llu (%llu), modules %llu (%llu); "
+	            "process private %llu, working set %llu MiB\n",
+	            mib(private_sum.committed), mib(private_sum.resident), mib(mapped_sum.committed), mib(mapped_sum.resident),
+	            mib(image_sum.committed), mib(image_sum.resident), mib(memory.private_bytes), mib(memory.working_set));
+	return true;
+}
+
 MemoryUse ProcessMemory() {
 	PROCESS_MEMORY_COUNTERS_EX counters {};
 	counters.cb = sizeof(counters);
@@ -1531,6 +1694,8 @@ void LogAddressSpace(const char* label, uint64_t begin, uint64_t end) {
 
 static IDXGIAdapter3* g_video_memory_adapter = nullptr;
 
+static void StartAdapterMemorySampler(const LUID& luid);
+
 bool OpenVideoMemoryAdapter(const uint8_t* luid) {
 	HMODULE dxgi = LoadLibraryA("dxgi.dll");
 	if (dxgi == nullptr || g_video_memory_adapter != nullptr) return g_video_memory_adapter != nullptr;
@@ -1543,6 +1708,7 @@ bool OpenVideoMemoryAdapter(const uint8_t* luid) {
 	if (FAILED(factory->EnumAdapterByLuid(id, __uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&g_video_memory_adapter))))
 		g_video_memory_adapter = nullptr;
 	factory->Release();
+	if (g_video_memory_adapter != nullptr) StartAdapterMemorySampler(id);
 	return g_video_memory_adapter != nullptr;
 }
 
@@ -1562,6 +1728,71 @@ bool QuerySharedGpuMemory(uint64_t* usage) {
 	    FAILED(g_video_memory_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info)))
 		return false;
 	*usage = info.CurrentUsage;
+	return true;
+}
+
+// The whole card's video memory in use, every process's (the desktop's 1.4 GB, other programs', the driver's for this
+// one): the "GPU Adapter Memory" performance counter of the adapter with this LUID, read once a second on a thread of
+// its own (pdh.dll, loaded when first needed: a query takes milliseconds).
+static std::atomic<uint64_t> g_adapter_in_use {0};
+static std::atomic<int64_t>  g_adapter_sampled_ms {0};
+
+static void StartAdapterMemorySampler(const LUID& luid) {
+	static std::once_flag once;
+	std::call_once(once, [luid] {
+		std::thread([luid] {
+			SetThreadDescription(GetCurrentThread(), L"Kyty.CardMemory");
+			HMODULE pdh = LoadLibraryW(L"pdh.dll");
+			if (pdh == nullptr) return;
+			using Open    = LONG(WINAPI*)(LPCWSTR, DWORD_PTR, PDH_HQUERY*);
+			using Add     = LONG(WINAPI*)(PDH_HQUERY, LPCWSTR, DWORD_PTR, PDH_HCOUNTER*);
+			using Collect = LONG(WINAPI*)(PDH_HQUERY);
+			using Values  = LONG(WINAPI*)(PDH_HCOUNTER, DWORD, LPDWORD, LPDWORD, PPDH_FMT_COUNTERVALUE_ITEM_W);
+			const auto open    = reinterpret_cast<Open>(GetProcAddress(pdh, "PdhOpenQueryW"));
+			const auto add     = reinterpret_cast<Add>(GetProcAddress(pdh, "PdhAddEnglishCounterW"));
+			const auto collect = reinterpret_cast<Collect>(GetProcAddress(pdh, "PdhCollectQueryData"));
+			const auto values  = reinterpret_cast<Values>(GetProcAddress(pdh, "PdhGetFormattedCounterArrayW"));
+			PDH_HQUERY   query   = nullptr;
+			PDH_HCOUNTER counter = nullptr;
+			if (open == nullptr || add == nullptr || collect == nullptr || values == nullptr ||
+			    open(nullptr, 0, &query) != ERROR_SUCCESS ||
+			    add(query, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &counter) != ERROR_SUCCESS)
+				return;
+			// The instances are named after the adapter: "luid_0x00000000_0x0000d1f3_phys_0".
+			wchar_t name[64] {};
+			std::swprintf(name, std::size(name), L"luid_0x%08x_0x%08x", static_cast<unsigned>(luid.HighPart),
+			              static_cast<unsigned>(luid.LowPart));
+			std::vector<uint8_t> buffer;
+			for (;;) {
+				DWORD size = 0, count = 0;
+				if (collect(query) == ERROR_SUCCESS &&
+				    values(counter, PDH_FMT_LARGE, &size, &count, nullptr) == static_cast<LONG>(PDH_MORE_DATA) && size != 0) {
+					buffer.resize(size);
+					auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+					if (values(counter, PDH_FMT_LARGE, &size, &count, items) == ERROR_SUCCESS) {
+						uint64_t total = 0;
+						bool     found = false;
+						for (DWORD i = 0; i < count; ++i) {
+							if (items[i].szName == nullptr || _wcsnicmp(items[i].szName, name, wcslen(name)) != 0) continue;
+							total += static_cast<uint64_t>(std::max<LONGLONG>(items[i].FmtValue.largeValue, 0));
+							found = true;
+						}
+						if (found) {
+							g_adapter_in_use.store(total, std::memory_order_relaxed);
+							g_adapter_sampled_ms.store(static_cast<int64_t>(GetTickCount64()), std::memory_order_release);
+						}
+					}
+				}
+				Sleep(1000);
+			}
+		}).detach();
+	});
+}
+
+bool QueryAdapterVideoMemory(uint64_t* in_use) {
+	const int64_t sampled = g_adapter_sampled_ms.load(std::memory_order_acquire);
+	if (sampled == 0 || static_cast<int64_t>(GetTickCount64()) - sampled > 5000) return false;
+	*in_use = g_adapter_in_use.load(std::memory_order_relaxed);
 	return true;
 }
 
@@ -1734,6 +1965,14 @@ bool CurrentThreadStack(uint64_t* low, uint64_t* high) {
 	return found;
 }
 
+bool RaiseThreadPriority() {
+	return setpriority(PRIO_PROCESS, static_cast<id_t>(ThreadId()), -5) == 0;
+}
+
+bool SetThreadHandlePriority(uint64_t, int) {
+	return false;
+}
+
 void AvoidCpuList(const char* avoid_cpus) {
 	cpu_set_t set;
 	if (const auto avoid = CpuListMask(avoid_cpus); avoid != 0 && sched_getaffinity(0, sizeof(set), &set) == 0) {
@@ -1803,7 +2042,25 @@ uint64_t OpenFileForReading(const char* path) {
 	return fd < 0 ? 0 : static_cast<uint64_t>(fd) + 1;
 }
 
+uint64_t OpenFileForWriting(const char* path, bool truncate) {
+	const int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | (truncate ? O_TRUNC : 0), 0644);
+	return fd < 0 ? 0 : static_cast<uint64_t>(fd) + 1;
+}
+
+bool TruncateFile(uint64_t file, uint64_t size) {
+	return file != 0 && ftruncate(static_cast<int>(file - 1), static_cast<off_t>(size)) == 0;
+}
+
+uint64_t FileSize(uint64_t file) {
+	struct stat info {};
+	return file != 0 && fstat(static_cast<int>(file - 1), &info) == 0 ? static_cast<uint64_t>(info.st_size) : 0;
+}
+
 bool WriteHeapHistogram(const char*) {
+	return false;
+}
+
+bool WriteAddressSpaceCensus(const char*) {
 	return false;
 }
 
@@ -1865,6 +2122,10 @@ bool QueryVideoMemory(uint64_t* /*usage*/, uint64_t* /*budget*/) {
 }
 
 bool QuerySharedGpuMemory(uint64_t* /*usage*/) {
+	return false;
+}
+
+bool QueryAdapterVideoMemory(uint64_t* /*in_use*/) {
 	return false;
 }
 
