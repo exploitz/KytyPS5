@@ -41,7 +41,6 @@
 #include "graphics/presentation/window/startupProgress.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "frame-gen.h"
-#include "fsr-frame-gen.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -988,7 +987,6 @@ static void WindowCreate(WindowContext& context) {
 	// KYTY_FRAMEGEN: Streamline must be initialized before SDL loads Vulkan with the window, and
 	// then becomes that loader (the instance and device are created through it).
 	Libs::Graphics::FrameGen::Initialize();
-	Libs::Graphics::FsrFrameGen::Initialize();
 #endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
 	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
@@ -1172,16 +1170,13 @@ void WindowContext::UpdateTitle() {
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	// With frame generation the fps above counts the game's own frames; the frames shown follow it.
-	const uint32_t shown = FsrFrameGen::Enabled() ? FsrFrameGen::PresentedFrames()
-	                       : FrameGen::Enabled()  ? FrameGen::PresentedFrames()
-	                                              : 1u;
+	const uint32_t shown = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}{}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps,
-	    shown > 1 ? fmt::format(", shown: {:.0f} ({} frame generation {}x)", current_fps * shown,
-	                            FsrFrameGen::Enabled() ? "FSR" : "DLSS", shown)
+	    shown > 1 ? fmt::format(", shown: {:.0f} (DLSS frame generation {}x)", current_fps * shown, shown)
 	              : std::string {});
 	if (const auto waypoints = Loader::DemonsSoulsWarp::RecordedWaypoints(); waypoints != 0) {
 		text += fmt::format(", waypoints: {}", waypoints);

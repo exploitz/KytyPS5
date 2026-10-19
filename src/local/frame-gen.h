@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -28,6 +29,13 @@ namespace FrameGen {
 constexpr std::array<uint64_t, 2> TaaShaders {0xa44e580f4f0cfb2bULL, 0x934a6e1197b99148ULL};
 constexpr std::array<uint64_t, 6> GbufferVertexShaders {0xf4d2e78cd1769fc7ULL, 0x08e16923875aa8e9ULL, 0x0ffcbf08be26e74eULL,
                                                         0x1d69b5d27198446aULL, 0x5931e753b757f3bcULL, 0xa97f610824942162ULL};
+// Draws of the G-buffer vertex shaders since start: 3D gameplay is on screen (the harness and the
+// scripted input use it to tell the level from menus, movies and loading screens).
+inline std::atomic<uint64_t> g_gameplay_draws {0};
+inline void NoteGameplayDraw(uint64_t vs_hash) {
+	if (std::find(GbufferVertexShaders.begin(), GbufferVertexShaders.end(), vs_hash) != GbufferVertexShaders.end())
+		g_gameplay_draws.fetch_add(1, std::memory_order_relaxed);
+}
 inline bool IsTaaShader(uint64_t hash) {
 	return std::find(TaaShaders.begin(), TaaShaders.end(), hash) != TaaShaders.end();
 }
