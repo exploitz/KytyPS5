@@ -111,6 +111,8 @@ public:
 		return image.IsDefinitelyCpuDirty() && DirtyForView(image, desc);
 	}
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
+	// FindRenderTarget, or null when the target stopped being one since it was found (it is looked up again).
+	[[nodiscard]] vk::ImageView TryFindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];

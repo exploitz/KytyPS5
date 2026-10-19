@@ -44,6 +44,8 @@ uint32_t                   NumBytesPerElement(BufferFormat format);
 uint32_t                   BlockCompressedBytesPerBlock(BufferFormat format);
 uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
+// Whether the value names a format at all: the encoding leaves wide gaps (upstream PR #1019).
+bool                       IsDefinedBufferFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
 

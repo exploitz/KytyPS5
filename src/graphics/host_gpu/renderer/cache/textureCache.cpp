@@ -3460,14 +3460,18 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+	const auto view = TryFindRenderTarget(id, desc);
+	if (view == nullptr) EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
+	return view;
+}
+
+vk::ImageView TextureCache::TryFindRenderTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
-	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
-	}
+	if (!image.registered || image.depth_id || image.binding.needs_rebind) return nullptr;
 	TouchImage(image);
 	image.MarkGpuModified();
 	if (!image.usage.render_target) ++image.validity;

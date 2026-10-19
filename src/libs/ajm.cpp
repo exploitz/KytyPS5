@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/ajm/aac_decoder.h"
 #include "libs/ajm/atrac9_decoder.h"
@@ -9,6 +10,9 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <array>
+#include <chrono>
+#include <map>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -21,6 +25,17 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// The audio job dumps of this library (one block per decode job) follow --graphics-debug-dump like
+// the libAgc call dumps instead of printing unconditionally into a file log.
+#undef LOGF
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define LOGF(...)                                                                                  \
+	do {                                                                                           \
+		if (Config::GraphicsDebugDumpEnabled() && !::Log::IsSilent()) {                            \
+			::Log::Write(::fmt::sprintf(__VA_ARGS__));                                             \
+		}                                                                                          \
+	} while (false)
 
 namespace Libs::Audio::Ajm {
 
@@ -575,6 +590,95 @@ static bool AjmCodecIsValid(uint32_t codec) {
 	}
 }
 
+// DIAGNOSTIC (KYTY_AJM_STATS=1): every 5 s, decode jobs by result flags and by decoder format
+// (channels), with frames, bytes in/out and how many jobs produced only silence.
+namespace {
+struct AjmStats {
+	uint64_t jobs = 0, frames = 0, in = 0, out = 0, silent = 0, no_output = 0;
+	std::map<int32_t, uint64_t> results;
+};
+std::mutex                      g_ajm_stats_mutex;
+std::map<uint32_t, AjmStats>    g_ajm_stats; // key: channels * 100 + codec
+uint64_t                        g_ajm_stats_last = 0;
+bool AjmStatsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AJM_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+void AjmNoteDecode(uint32_t key, const void* output, const AjmDecodeResult& result) {
+	std::scoped_lock lock(g_ajm_stats_mutex);
+	auto&            s = g_ajm_stats[key];
+	s.jobs++;
+	s.frames += result.frames;
+	s.in += result.input_consumed;
+	s.out += result.output_written;
+	s.results[result.result]++;
+	if (result.output_written == 0) {
+		s.no_output++;
+	} else if (output != nullptr) {
+		const auto* bytes = static_cast<const uint8_t*>(output);
+		bool        silent = true;
+		for (size_t i = 0; i < result.output_written; i++) {
+			if (bytes[i] != 0) {
+				silent = false;
+				break;
+			}
+		}
+		s.silent += silent ? 1 : 0;
+	}
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (now - g_ajm_stats_last < 5'000'000) {
+		return;
+	}
+	g_ajm_stats_last = now;
+	for (auto& [k, st]: g_ajm_stats) {
+		std::printf("AjmStats codec=%u ch=%u jobs=%llu frames=%llu in=%llu out=%llu silent=%llu "
+		            "no_output=%llu results:",
+		            k % 100, k / 100, static_cast<unsigned long long>(st.jobs),
+		            static_cast<unsigned long long>(st.frames), static_cast<unsigned long long>(st.in),
+		            static_cast<unsigned long long>(st.out), static_cast<unsigned long long>(st.silent),
+		            static_cast<unsigned long long>(st.no_output));
+		for (auto [r, c]: st.results) {
+			std::printf(" 0x%x:%llu", static_cast<unsigned>(r), static_cast<unsigned long long>(c));
+		}
+		std::printf("\n");
+		st = {};
+	}
+	std::fflush(stdout);
+}
+} // namespace
+
+namespace {
+struct RecentJob {
+	uint64_t us = 0;
+	uint32_t instance = 0, codec = 0, channels = 0, result = 0, frames = 0;
+	size_t   in = 0, in_size = 0, out = 0, out_size = 0;
+	uint32_t total_before = 0, total_after = 0, skip = 0;
+	bool     multi = false;
+};
+std::mutex                 g_recent_mutex;
+std::array<RecentJob, 64>  g_recent {};
+uint32_t                   g_recent_next = 0;
+} // namespace
+
+void AjmDumpRecentJobs() {
+	std::lock_guard lock(g_recent_mutex);
+	std::printf("--- last AJM decode jobs (oldest first) ---\n");
+	for (uint32_t i = 0; i < g_recent.size(); i++) {
+		const auto& j = g_recent[(g_recent_next + i) % g_recent.size()];
+		if (j.us == 0) continue;
+		std::printf("t=%llu.%03llu inst=0x%x codec=%u ch=%u result=0x%x in=%zu/%zu out=%zu/%zu frames=%u multi=%d gapless %u->%u skip %u\n",
+		            static_cast<unsigned long long>(j.us / 1000000), static_cast<unsigned long long>((j.us / 1000) % 1000),
+		            j.instance, j.codec, j.channels, j.result, j.in, j.in_size, j.out, j.out_size, j.frames,
+		            j.multi ? 1 : 0, j.total_before, j.total_after, j.skip);
+	}
+	std::fflush(stdout);
+}
+
 static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
                                          void* output, size_t output_size, bool multiple_frames) {
 	std::scoped_lock lock(g_ajm_instances_mutex);
@@ -585,8 +689,65 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 		return result;
 	}
 
-	return state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
-	                              &state->gapless);
+	// A gapless stream that has delivered all of its samples and is then fed more input is a
+	// looping sound starting its next pass (Demon's Souls' ambience loops): the counters re-arm
+	// from the initial sideband, as the hardware's do. Leaving them at zero made every further job
+	// on the instance consume and produce nothing with a clean result, which the game's sample
+	// player treats as impossible (its assertion ends the process with a fault at address -1).
+	if (state->gapless.IsEnd() && input != nullptr && input_size != 0) {
+		// The new pass starts at the stream's first superframe, which decodes against a fresh
+		// codec state (the previous pass's band parameters make its scale factors unreadable:
+		// ERR_UNPACK_SCALE_FACTOR_MODE_INVALID on the room's ambience loop).
+		state->decoder->Reset();
+		state->gapless.Reset();
+		static std::atomic<uint32_t> loops {0};
+		if (const auto n = loops.fetch_add(1, std::memory_order_relaxed) + 1; (n & (n - 1)) == 0) {
+			std::printf("AJM: %u gapless stream(s) re-armed for another pass\n", n);
+		}
+	}
+	const auto gapless_before = state->gapless.current;
+	auto result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
+	                                     &state->gapless);
+	{
+		std::lock_guard lock(g_recent_mutex);
+		auto& j        = g_recent[g_recent_next++ % g_recent.size()];
+		j.us           = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count());
+		j.instance     = instance;
+		j.codec        = state->codec;
+		j.channels     = result.format.channel_num;
+		j.result       = static_cast<uint32_t>(result.result);
+		j.frames       = result.frames;
+		j.in           = result.input_consumed;
+		j.in_size      = input_size;
+		j.out          = result.output_written;
+		j.out_size     = output_size;
+		j.total_before = gapless_before.total_samples;
+		j.total_after  = state->gapless.current.total_samples;
+		j.skip         = gapless_before.skip_samples;
+		j.multi        = multiple_frames;
+	}
+	if (AjmStatsEnabled()) {
+		AjmNoteDecode(state->codec + 100u * result.format.channel_num, output, result);
+		if (result.result != OK) {
+			// Every job the decoder did not complete cleanly: what it was asked and what it did.
+			const auto* bytes = static_cast<const uint8_t*>(input);
+			const auto  at    = std::min(result.input_consumed, input_size >= 16 ? input_size - 16 : 0);
+			std::printf("AjmJob instance=0x%x result=0x%x internal=%d in=%zu/%zu out=%zu/%zu frames=%u multi=%d "
+			            "gapless total %u->%u skip %u->%u skipped %u init_total=%u input=%p "
+			            "next=%02x%02x%02x%02x%02x%02x%02x%02x first=%02x%02x%02x%02x\n",
+			            instance, static_cast<unsigned>(result.result), result.internal_result,
+			            result.input_consumed, input_size, result.output_written, output_size,
+			            result.frames, multiple_frames ? 1 : 0, gapless_before.total_samples,
+			            state->gapless.current.total_samples, gapless_before.skip_samples,
+			            state->gapless.current.skip_samples, state->gapless.current.skipped_samples,
+			            state->gapless.init.total_samples, input, bytes[at], bytes[at + 1], bytes[at + 2],
+			            bytes[at + 3], bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7], bytes[0],
+			            bytes[1], bytes[2], bytes[3]);
+			std::fflush(stdout);
+		}
+	}
+	return result;
 }
 
 static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,

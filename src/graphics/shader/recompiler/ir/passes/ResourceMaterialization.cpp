@@ -107,6 +107,11 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	    format > Prospero::BufferFormat::kBc7Srgb) {
 		return false;
 	}
+	// The range above leaves the encoding's gaps open: a value such as 139 names nothing, and used to
+	// pass here and abort further down (upstream PR #1019, tvhdev, in Demon's Souls); it is no descriptor.
+	if (!Prospero::IsDefinedBufferFormat(format)) {
+		return false;
+	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
 	    type != Prospero::ImageType::kColor2DMsaa) {
 		return false;

@@ -215,6 +215,11 @@ if(KYTY_CLANG_CL)
 	endif()
 endif()
 
+# The host allocator behind operator new/delete (the render thread allocates per draw and dispatch). Chen's
+# Linux play setup preloads libmimalloc.so; on Windows it is linked in (10-06 A/B, PGO builds, still view:
+# 1-1 +2.2%, 1-2 +2.5%, Latria +1.4%; moving: 1-1 +4.7%, the Nexus -2.0%, within its noise).
+option(KYTY_MIMALLOC "operator new/delete from mimalloc (fetched, v2.5.2)" ON)
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
@@ -516,6 +521,9 @@ target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/local/static-s
 target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/local/shader-hints.h"
 	"${KYTY_SOURCE_DIR}/local/shader-hints.cpp")
 target_link_libraries(kyty_shader_precompile libzstd_static)
+if(WIN32)
+	target_sources(kyty_shader_precompile PRIVATE "${KYTY_SOURCE_DIR}/kyty-utf8.manifest")
+endif()
 if (WIN32)
 	target_link_libraries(kyty_shader_precompile opengl32 setupapi ws2_32)
 endif()
@@ -710,6 +718,10 @@ if(BUILD_TESTING)
 	add_executable(atrac9_initialization_tests EXCLUDE_FROM_ALL tests/Atrac9InitializationTests.cpp)
 	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
 	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
+	# The game's .at9 files as arguments: `atrac9_overread_tests padded <file>...` (raw: libatrac9 in place).
+	add_executable(atrac9_overread_tests EXCLUDE_FROM_ALL tests/Atrac9OverreadTests.cpp)
+	target_link_libraries(atrac9_overread_tests PRIVATE LibAtrac9)
+	target_include_directories(atrac9_overread_tests PRIVATE "${KYTY_SOURCE_DIR}")
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -827,6 +839,10 @@ endif()
 
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+if(WIN32)
+	# UTF-8 as the process's code page: paths with any characters on the command line and in narrow file functions.
+	target_sources(kyty_emulator PRIVATE "${KYTY_SOURCE_DIR}/kyty-utf8.manifest")
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 if(LINUX)
@@ -851,6 +867,11 @@ if(LINUX)
 endif()
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
+if(KYTY_MIMALLOC)
+	# main.cpp replaces operator new/delete with mimalloc for this executable only.
+	target_link_libraries(kyty_emulator mimalloc-static)
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS KYTY_MIMALLOC=1)
+endif()
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)

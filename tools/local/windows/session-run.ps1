@@ -1,5 +1,5 @@
 param([string]$Label = 'session', [string]$Exe = '', [int]$Cycles = 2, [string[]]$Set = @(), [string[]]$Extra = @(),
-      [switch]$NoPrecompile, [switch]$KeepRunning, [int]$Vblank = 0)
+      [switch]$NoPrecompile, [switch]$KeepRunning, [int]$Vblank = 0, [int]$StartupSeconds = 240)
 # A play-like session without a player: the launch from the bench save (bench-run.ps1), then the worlds in turn by
 # archstone travel (gamecmd +cp11_loadLevel), each with the seconds right after the load measured standing (the
 # stalls after an area load hide there), a camera turn and a short walk, and the whole card's video memory sampled
@@ -14,13 +14,16 @@ Set-Location $root
 $out = "$root\_Build\session\$Label"
 New-Item -ItemType Directory -Force $out | Out-Null
 
-$params = @{ Label = $Label; KeepRunning = $true; NoWalk = $true; ShotOnly = $true }
+$params = @{ Label = $Label; KeepRunning = $true; NoWalk = $true; ShotOnly = $true; StartupSeconds = $StartupSeconds }
 if ($Exe) { $params['Exe'] = $Exe }
 if ($Set.Count) { $params['Set'] = $Set }
 if ($Extra.Count) { $params['Extra'] = $Extra }
 if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
 if ($NoPrecompile) { $params['NoPrecompile'] = $true }
-& "$S\bench-run.ps1" @params | Select-Object -Last 3
+$started = & "$S\bench-run.ps1" @params
+$started | Select-Object -Last 3
+# (A start-up still at the menu leaves the emulator running: only the HUD counts.)
+if (!($started -match '^HUD after')) { 'no HUD: the session stops'; Get-Process kyty_emulator -ErrorAction SilentlyContinue | Stop-Process -Force; exit 1 }
 if (!(Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object { $_.Threads.Count -gt 1 })) { 'emulator not running'; exit 1 }
 
 # The whole card's memory, once a second, until this script ends.
@@ -39,7 +42,7 @@ $legs.Add('label,start_ms,end_ms,fps,low1,p99_ms,max_ms,over50,over100,render_bu
 function Live([string]$commands) {
 	python tools\local\bench-windows.py live $commands | Where-Object { $_ -match '^LIVE_' }
 }
-function Measure([string]$name, [string]$before = '') {
+function Leg([string]$name, [string]$before = '') {
 	$begin = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
 	$lines = Live (($before, $name) -ne '' -join ' ; ')
 	$end = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
@@ -53,9 +56,9 @@ function Measure([string]$name, [string]$before = '') {
 }
 # pad LX LY RX RY BUTTONS SECONDS (128 = centred): the turn spins the camera right, the walk goes ahead turning slowly.
 Live 'gamecmd +cp11_unlockAllArchstones' | Out-Null
-Measure 'measure 20 start-stand'
-Measure 'measure 20 start-turn' 'pad 128 128 200 128 0 20'
-Measure 'measure 15 start-walk' 'pad 128 0 150 128 0 15'
+Leg 'measure 20 start-stand'
+Leg 'measure 20 start-turn' 'pad 128 128 200 128 0 20'
+Leg 'measure 15 start-walk' 'pad 128 0 150 128 0 15'
 $worlds = @(@(2, 1), @(3, 1), @(4, 1), @(5, 1), @(1, 1))
 for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
 	foreach ($w in $worlds) {
@@ -63,9 +66,9 @@ for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
 		Live "gamecmd +cp11_loadLevel $($w[0]) $($w[1])" | Out-Null
 		# The load (fog, then the area): nothing measured while it runs; 35 s covers this PC's loads.
 		Start-Sleep -Seconds 35
-		Measure "measure 20 $tag-arrive"
-		Measure "measure 20 $tag-turn" 'pad 128 128 200 128 0 20'
-		Measure "measure 15 $tag-walk" 'pad 128 0 150 128 0 15'
+		Leg "measure 20 $tag-arrive"
+		Leg "measure 20 $tag-turn" 'pad 128 128 200 128 0 20'
+		Leg "measure 15 $tag-walk" 'pad 128 0 150 128 0 15'
 		powershell -NoProfile -File "$S\screen.ps1" -Out "$out\$tag.png" -Scale 0.25 | Out-Null
 	}
 }
@@ -75,7 +78,7 @@ Stop-Job $vram; Remove-Job $vram
 $rows = Import-Csv "$out\legs.csv"
 $card = Import-Csv "$out\vram.csv"
 function Mean($values) { if ($values.Count) { ($values | Measure-Object -Average).Average } else { 0 } }
-"== $Label: $($rows.Count) legs"
+"== ${Label}: $($rows.Count) legs"
 "fps mean {0:N1}  low1 mean {1:N1}  p99 mean {2:N1} ms  max {3:N0} ms  frames >100 ms {4}  >50 ms {5}" -f
 	(Mean ($rows | ForEach-Object { [double]$_.fps })), (Mean ($rows | ForEach-Object { [double]$_.low1 })),
 	(Mean ($rows | ForEach-Object { [double]$_.p99_ms })), (($rows | ForEach-Object { [double]$_.max_ms } | Measure-Object -Maximum).Maximum),

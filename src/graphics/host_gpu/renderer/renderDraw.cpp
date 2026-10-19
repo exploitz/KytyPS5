@@ -719,17 +719,26 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
-		const auto old_image = cache.m_slot_images.try_get(target.image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
+		vk::ImageView image_view = nullptr;
+		for (uint32_t attempt = 0; image_view == nullptr; ++attempt) {
+			const auto old_image = cache.m_slot_images.try_get(target.image_id);
+			if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
+			    old_image->binding.needs_rebind) {
+				if (old_image != nullptr) {
+					old_image->binding = {};
+				}
+				target.image_id = cache.FindImage(target.desc);
+				BindRenderTarget(target.image_id);
 			}
-			target.image_id = cache.FindImage(target.desc);
-			BindRenderTarget(target.image_id);
+			// The target can stop being one between the lookup and the acquisition (each under the cache's lock): a
+			// game thread's unmap, a replacement. Found again, a few times (10-15: a HUD draw ended the emulator while
+			// the pause menu was opened as the warmup and the prefetch ran).
+			image_view = cache.TryFindRenderTarget(target.image_id, target.desc);
+			if (image_view == nullptr && attempt == 3) {
+				EXIT("TextureCache: color target requires rediscovery before final acquisition (found again 3 times)\n");
+			}
 		}
-		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
-		auto&      image      = cache.GetImage(target.image_id);
+		auto& image = cache.GetImage(target.image_id);
 		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
 		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
 		                     target.target_slot, image.info.data.address, image.info.data.size,
