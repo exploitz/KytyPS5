@@ -707,10 +707,430 @@ static void StartTapeMarkerWatch() {
 	}).detach();
 }
 
+// ---- route walker ----------------------------------------------------------------------------------------------------
+// KYTY_ROUTE=<file.track> (or the live `route <file>`): the character walks a player's recorded path (a tape's track,
+// above) with stick input, as the player did: the left stick forward, the camera turned toward the path ahead with the
+// right stick. A replayed tape gives the game the recorded presses at the recorded times, but the game is not
+// frame-exact (its step follows the frame time), so a replay drifts within a minute and walks into walls; a glide
+// (DemonsSoulsWarp::Glide) stays on the path but moves the player by warp requests, without the walk, its animation or
+// the camera a player has. The walker follows the path by position instead and corrects whatever the frame times did.
+// The camera's yaw is not read: as a player does, it turns the camera until the character, walking camera-forward,
+// faces the waypoint about 3 m ahead (the turn's direction is learned from the first turns; KYTY_ROUTE_TURN_SIGN=1/-1
+// fixes it; KYTY_ROUTE_TURN_GAIN, default 1: the full stick at 45 degrees off). A character standing still does not
+// turn with the camera, so far off (70 degrees and more) it walks slowly while the camera comes round. Stuck (under
+// 0.5 m in 2 s): a roll and a camera wiggle, again at 4 s; at 6 s a glide to the waypoint (counted). The tape beside
+// the track (the track's name without .track) gives the Cross presses: each is pressed again where the player was when
+// pressing it (doors, levers, fog walls, items). After a load (the player gone, or 30 m away at once) the walk resumes
+// at the nearest waypoint ahead. KYTY_ROUTE_LOOP=1: at the end, glided back to the start and walked again (a route
+// without loads). Once a second a "Route:" line (the waypoint, metres off the path, the heading error) for calibrating.
+namespace {
+struct RouteWaypoint {
+	double t = 0, x = 0, y = 0, z = 0;
+	double speed   = 0; // m/s the player went from the previous waypoint (0: a part's first)
+	int    segment = 0; // the part of the route between loads (points 30 m or more apart)
+};
+struct RouteInteraction {
+	double x = 0, y = 0, z = 0;
+	size_t after = 0; // the waypoint the player had passed last when pressing
+};
+struct RouteData {
+	std::string                   path;
+	std::vector<RouteWaypoint>    waypoints;
+	std::vector<RouteInteraction> interactions;
+	double                        full_speed = 1; // the recording's running speed (its 90th percentile)
+};
+
+// A new route or `route off` moves it on: the running walker sees another generation and ends.
+std::atomic<uint64_t> g_route_generation {0};
+constexpr double      RoutePi = 3.14159265358979323846;
+
+double RouteWrap(double radians) {
+	while (radians > RoutePi) radians -= 2 * RoutePi;
+	while (radians <= -RoutePi) radians += 2 * RoutePi;
+	return radians;
+}
+// The body's yaw for a direction on the ground (y is up): DemonsSoulsWarp::Glide's convention.
+double RouteHeading(double dx, double dz) {
+	return std::atan2(-dx, -dz);
+}
+double RouteFlat(double ax, double az, double bx, double bz) {
+	return std::hypot(ax - bx, az - bz);
+}
+double RouteDistance(double ax, double ay, double az, double bx, double by, double bz) {
+	return std::sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by) + (az - bz) * (az - bz));
+}
+
+bool LoadRoute(const std::string& path, RouteData& route) {
+	route      = {};
+	route.path = path;
+	FILE* f    = std::fopen(path.c_str(), "rb");
+	if (f == nullptr) {
+		std::printf("Route: cannot open %s\n", path.c_str());
+		std::fflush(stdout);
+		return false;
+	}
+	std::vector<TrackPoint> points;
+	char                    line[160];
+	while (std::fgets(line, sizeof(line), f) != nullptr) {
+		TrackPoint p;
+		if (std::sscanf(line, "%lf %lf %lf %lf", &p.t, &p.x, &p.y, &p.z) == 4) points.push_back(p);
+	}
+	std::fclose(f);
+	// Waypoints 1 m apart (the points of a player standing still fall away), a new part after each load.
+	int segment = 0;
+	for (size_t i = 0; i < points.size(); i++) {
+		const auto& p = points[i];
+		if (i > 0 && RouteDistance(p.x, p.y, p.z, points[i - 1].x, points[i - 1].y, points[i - 1].z) >= 30.0) segment++;
+		const bool first = route.waypoints.empty() || route.waypoints.back().segment != segment;
+		RouteWaypoint w {p.t, p.x, p.y, p.z, 0, segment};
+		if (!first) {
+			const auto&  b = route.waypoints.back();
+			const double d = RouteDistance(p.x, p.y, p.z, b.x, b.y, b.z);
+			if (d < 1.0) continue;
+			w.speed = d / std::max(p.t - b.t, 1e-3);
+		}
+		route.waypoints.push_back(w);
+	}
+	std::vector<double> speeds;
+	for (const auto& w: route.waypoints)
+		if (w.speed > 0.3) speeds.push_back(w.speed);
+	if (!speeds.empty()) {
+		std::sort(speeds.begin(), speeds.end());
+		route.full_speed = std::max(speeds[speeds.size() * 9 / 10], 0.5);
+	}
+	// The Cross presses of the tape beside it, placed where the player was (the track points around a press, 2 s apart
+	// at most: a press in a menu or a load has no place and is left out).
+	const std::string tape = path.size() > 6 && path.ends_with(".track") ? path.substr(0, path.size() - 6) : std::string();
+	if (FILE* t = tape.empty() ? nullptr : std::fopen(tape.c_str(), "rb"); t != nullptr) {
+#pragma pack(push, 1)
+		struct Record { // controller.cpp's InputRecord
+			uint32_t dt_us;
+			uint32_t buttons;
+			uint8_t  axes[6];
+		};
+#pragma pack(pop)
+		static_assert(sizeof(Record) == 14);
+		Record   r {};
+		uint32_t before = 0;
+		while (std::fread(&r, sizeof(r), 1, t) == 1) {
+			const bool press = (r.buttons & Controller::PAD_BUTTON_CROSS) != 0 && (before & Controller::PAD_BUTTON_CROSS) == 0;
+			before           = r.buttons;
+			if (!press) continue;
+			const double when = r.dt_us / 1e6;
+			const auto   it   = std::upper_bound(points.begin(), points.end(), when,
+			                                     [](double value, const TrackPoint& p) { return value < p.t; });
+			if (it == points.begin() || it == points.end() || it->t - (it - 1)->t > 2.0) continue;
+			const auto&      a = *(it - 1);
+			const auto&      b = *it;
+			const double     f = (when - a.t) / std::max(b.t - a.t, 1e-3);
+			RouteInteraction in {a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f, 0};
+			for (size_t w = 0; w < route.waypoints.size() && route.waypoints[w].t <= when; w++) in.after = w;
+			route.interactions.push_back(in);
+		}
+		std::fclose(t);
+	}
+	std::printf("Route: %s: %zu waypoints in %d part(s), %zu Cross presses, running speed %.1f m/s\n", path.c_str(),
+	            route.waypoints.size(), segment + 1, route.interactions.size(), route.full_speed);
+	std::fflush(stdout);
+	return route.waypoints.size() >= 2;
+}
+
+// The pad the game reads goes back to the host's (the keyboard, the controller, a live `pad`).
+void ReleaseRouteInput() {
+	Controller::SetScriptedInput(-1, -1, -1, -1, 0, 0);
+}
+
+// The nearest waypoint from `from` on (3D: parts of a level lie above one another); the whole route when none ahead is
+// within 30 m.
+size_t NearestWaypoint(const std::vector<RouteWaypoint>& wps, size_t from, double x, double y, double z, double* distance) {
+	size_t best = 0;
+	double near = 1e30;
+	for (int pass = 0; pass < 2 && near >= 30.0; pass++) {
+		for (size_t i = pass == 0 ? from : 0; i < wps.size(); i++) {
+			const double d = RouteDistance(x, y, z, wps[i].x, wps[i].y, wps[i].z);
+			if (d < near) {
+				near = d;
+				best = i;
+			}
+		}
+	}
+	*distance = near;
+	return best;
+}
+
+void RouteThread(RouteData route, uint64_t generation) {
+	using Clock      = std::chrono::steady_clock;
+	const auto alive = [generation] { return g_route_generation.load(std::memory_order_acquire) == generation; };
+	const auto secs  = [](Clock::duration d) { return std::chrono::duration<double>(d).count(); };
+	const auto env   = [](const char* name) {
+		const char* value = std::getenv(name);
+		return value != nullptr && value[0] != '\0' ? value : nullptr;
+	};
+	const double turn_gain = env("KYTY_ROUTE_TURN_GAIN") != nullptr ? std::atof(env("KYTY_ROUTE_TURN_GAIN")) : 1.0;
+	int          sign      = env("KYTY_ROUTE_TURN_SIGN") != nullptr && std::atoi(env("KYTY_ROUTE_TURN_SIGN")) < 0 ? -1 : 1;
+	bool         learn     = env("KYTY_ROUTE_TURN_SIGN") == nullptr; // the sign from the first turns
+	const bool   loop      = env("KYTY_ROUTE_LOOP") != nullptr && env("KYTY_ROUTE_LOOP")[0] == '1';
+	const auto&  wps       = route.waypoints;
+	constexpr size_t Unplaced = static_cast<size_t>(-1);
+
+	size_t   cursor = Unplaced; // the waypoint walked to
+	size_t   next_press = 0;    // the next of route.interactions
+	uint32_t glides = 0, presses = 0;
+	bool     released = false, absent = true, far_logged = false;
+	auto     now           = Clock::now();
+	uint64_t draws_before  = FrameGen::g_gameplay_draws.load(std::memory_order_relaxed);
+	auto     draws_changed = now;
+	auto     busy_until    = now; // a glide on its way: no input
+	auto     pause_until   = now; // standing for a press
+	auto     press_until   = now; // Cross held
+	auto     roll_until    = now; // Circle held (a roll)
+	auto     wiggle_from = now, wiggle_until = now;
+	auto     part_end_since = Clock::time_point {}; // standing at the end of a part, for the load that follows
+	double   progress_x = 0, progress_y = 0, progress_z = 0; // where the walk last made 0.5 m of progress, and when
+	double   last_x = 0, last_y = 0, last_z = 0;               // the position a step ago (a jump of 30 m: a load)
+	bool     have_last = false;
+	auto     progress_t   = now;
+	int      unstick_step = 0; // the rolls done this time stuck
+	auto     log_t        = now;
+	// Learning the turn's sign: the yaw at the start of a 0.5 s window of turning one way while walking.
+	double learn_yaw = 0, learn_x = 0, learn_z = 0;
+	int    learn_dir = 0, learn_wrong = 0, learn_right = 0;
+	auto   learn_t0  = now;
+
+	for (;; SDL_Delay(33)) {
+		if (!alive()) return; // (HostInputStopRoute or the next route released the input)
+		now               = Clock::now();
+		const auto draws  = FrameGen::g_gameplay_draws.load(std::memory_order_relaxed);
+		if (draws != draws_before) {
+			draws_before  = draws;
+			draws_changed = now;
+		}
+		float      xyz[3] {}, yaw_f = 0;
+		const bool player = Loader::DemonsSoulsWarp::PlayerPosition(xyz, &yaw_f);
+		// Loads, menus, cutscenes: no player, or no gameplay drawn for half a second.
+		if (!player || secs(now - draws_changed) > 0.5) {
+			if (!released) ReleaseRouteInput();
+			released = true;
+			absent   = true;
+			continue;
+		}
+		if (now < busy_until) continue;
+		const double px = xyz[0], py = xyz[1], pz = xyz[2], yaw = yaw_f;
+		if (have_last && RouteDistance(px, py, pz, last_x, last_y, last_z) >= 30.0) absent = true; // (a load without a gap)
+		last_x    = px;
+		last_y    = py;
+		last_z    = pz;
+		have_last = true;
+		// Placed on the route: at the start, and after a load if the waypoint walked to is far.
+		if (cursor == Unplaced ||
+		    (absent && RouteDistance(px, py, pz, wps[cursor].x, wps[cursor].y, wps[cursor].z) >= 30.0)) {
+			double     d    = 0;
+			const auto from = cursor == Unplaced ? 0 : cursor;
+			const auto at   = NearestWaypoint(wps, from, px, py, pz, &d);
+			if (d >= 30.0) {
+				if (!far_logged) std::printf("Route: the player is %.0f m from the route: waiting\n", d);
+				far_logged = true;
+				if (!released) ReleaseRouteInput();
+				released = true;
+				cursor   = Unplaced;
+				continue;
+			}
+			cursor = at;
+			while (next_press < route.interactions.size() && route.interactions[next_press].after + 1 < cursor) next_press++;
+			std::printf("Route: at waypoint %zu/%zu (%.1f m away)\n", cursor, wps.size(), d);
+			far_logged = false;
+			progress_x = px;
+			progress_y = py;
+			progress_z = pz;
+			progress_t = now;
+		}
+		absent   = false;
+		released = false;
+		const int part = wps[cursor].segment;
+		const auto same_part = [&](size_t i) { return i < wps.size() && wps[i].segment == part; };
+		// Waypoints reached (1.5 m on the ground), and one further on the player is already at (a corner cut).
+		while (same_part(cursor + 1) && RouteFlat(px, pz, wps[cursor].x, wps[cursor].z) < 1.5) cursor++;
+		for (size_t i = cursor + 1; i < cursor + 8 && same_part(i); i++) {
+			if (RouteFlat(px, pz, wps[i].x, wps[i].z) < 1.5) {
+				cursor = same_part(i + 1) ? i + 1 : i;
+				break;
+			}
+		}
+		const bool at_part_end = !same_part(cursor + 1) && RouteFlat(px, pz, wps[cursor].x, wps[cursor].z) < 1.5;
+		if (at_part_end && cursor + 1 >= wps.size()) {
+			ReleaseRouteInput();
+			std::printf("Route: done (%zu waypoints, %u glides, %u interactions)\n", wps.size(), glides, presses);
+			std::fflush(stdout);
+			if (!loop) return;
+			if (wps.back().segment != 0) {
+				std::printf("Route: KYTY_ROUTE_LOOP needs a route without loads; stopped\n");
+				std::fflush(stdout);
+				return;
+			}
+			const double seconds = Loader::DemonsSoulsWarp::Glide(static_cast<float>(wps[0].x), static_cast<float>(wps[0].y),
+			                                                      static_cast<float>(wps[0].z), 12.0f);
+			busy_until = now + std::chrono::milliseconds(static_cast<int64_t>(std::max(seconds, 0.0) * 1000 + 300));
+			cursor     = 0;
+			next_press = 0;
+			progress_t = busy_until;
+			continue;
+		}
+		if (at_part_end) {
+			// The recording loaded here (an archstone, a death, a lift): stand and wait for the load the presses bring.
+			if (part_end_since == Clock::time_point {}) part_end_since = now;
+			if (secs(now - part_end_since) > 30.0) {
+				ReleaseRouteInput();
+				std::printf("Route: ended at the end of part %d: no load came in 30 s (%u glides, %u interactions)\n", part,
+				            glides, presses);
+				std::fflush(stdout);
+				return;
+			}
+		} else {
+			part_end_since = {};
+		}
+
+		// A Cross press of the recording due here: stand, press, give the game a moment (a door, a lever, an item).
+		while (next_press < route.interactions.size() && route.interactions[next_press].after + 6 < cursor) {
+			const auto& in = route.interactions[next_press++];
+			std::printf("Route: passed the Cross press at %.1f %.1f %.1f without reaching it\n", in.x, in.y, in.z);
+		}
+		if (next_press < route.interactions.size() && now >= pause_until) {
+			const auto& in = route.interactions[next_press];
+			if (in.after <= cursor + 1 && RouteFlat(px, pz, in.x, in.z) <= 1.5 && std::abs(py - in.y) <= 2.0) {
+				press_until = now + std::chrono::milliseconds(150);
+				pause_until = now + std::chrono::milliseconds(800);
+				presses++;
+				next_press++;
+			}
+		}
+
+		// The waypoint about 3 m ahead along the route (the one walked to while 2.5 m or more off the path).
+		size_t target = cursor;
+		double off    = RouteFlat(px, pz, wps[cursor].x, wps[cursor].z);
+		if (cursor > 0 && same_part(cursor - 1)) {
+			// (Off the path: the distance to the line from the previous waypoint to this one.)
+			const auto&  a  = wps[cursor - 1];
+			const auto&  b  = wps[cursor];
+			const double vx = b.x - a.x, vz = b.z - a.z;
+			const double len2 = vx * vx + vz * vz;
+			const double f    = len2 > 1e-6 ? std::clamp(((px - a.x) * vx + (pz - a.z) * vz) / len2, 0.0, 1.0) : 0.0;
+			off               = RouteFlat(px, pz, a.x + vx * f, a.z + vz * f);
+		}
+		if (off < 2.5) {
+			double along = RouteFlat(px, pz, wps[cursor].x, wps[cursor].z);
+			while (along < 3.0 && same_part(target + 1)) {
+				along += RouteFlat(wps[target].x, wps[target].z, wps[target + 1].x, wps[target + 1].z);
+				target++;
+			}
+		}
+		const double error   = RouteWrap(RouteHeading(wps[target].x - px, wps[target].z - pz) - yaw);
+		const double error_d = error * 180.0 / RoutePi;
+		double       turn    = std::abs(error_d) < 4.0 ? 0.0 : std::clamp(turn_gain * error_d / 45.0, -1.0, 1.0);
+		double forward = wps[target].speed > 0 ? std::clamp(wps[target].speed / route.full_speed, 0.35, 1.0) : 1.0;
+		if (std::abs(error_d) > 70.0) {
+			forward = 0.3; // nearly turned around: walking slowly, the character turns with the camera
+			turn    = error_d > 0 ? 1.0 : -1.0;
+		}
+		const bool standing = now < pause_until || at_part_end;
+		if (standing) forward = turn = 0;
+
+		// Stuck: under 0.5 m of progress in 2 s while walking. A roll and a camera wiggle at 2 s and 4 s, a glide at 6 s.
+		if (standing || RouteDistance(px, py, pz, progress_x, progress_y, progress_z) >= 0.5) {
+			progress_x   = px;
+			progress_y   = py;
+			progress_z   = pz;
+			progress_t   = now;
+			unstick_step = 0;
+		} else if (const double stuck = secs(now - progress_t); stuck >= 6.0) {
+			const auto&  w       = wps[cursor];
+			const double seconds = Loader::DemonsSoulsWarp::Glide(static_cast<float>(w.x), static_cast<float>(w.y),
+			                                                      static_cast<float>(w.z), 4.0f);
+			glides++;
+			std::printf("Route: stuck 6 s at %.1f %.1f %.1f: glided to waypoint %zu (%.1f s; %u glides)\n", px, py, pz, cursor,
+			            seconds, glides);
+			std::fflush(stdout);
+			busy_until   = now + std::chrono::milliseconds(static_cast<int64_t>(std::max(seconds, 0.0) * 1000 + 300));
+			progress_t   = busy_until;
+			unstick_step = 0;
+			continue;
+		} else if (stuck >= 2.0 * (unstick_step + 1) && unstick_step < 2) {
+			unstick_step++;
+			roll_until   = now + std::chrono::milliseconds(120);
+			wiggle_from  = now;
+			wiggle_until = now + std::chrono::milliseconds(600);
+			std::printf("Route: stuck %.0f s at %.1f %.1f %.1f: a roll and a camera wiggle\n", stuck, px, py, pz);
+		}
+
+		int rx = 128 + sign * static_cast<int>(std::lround(turn * 127.0));
+		if (now < wiggle_until) rx = 128 + ((static_cast<int>(secs(now - wiggle_from) * 6.0) % 2) != 0 ? 90 : -90);
+		const int      ly      = 128 - static_cast<int>(std::lround(forward * 127.0));
+		const uint32_t buttons = (now < press_until ? Controller::PAD_BUTTON_CROSS : 0u) |
+		                         (now < roll_until ? Controller::PAD_BUTTON_CIRCLE : 0u);
+		// (A short hold, renewed each step: if this thread stopped, the pad would be the host's again at once.)
+		Controller::SetScriptedInput(128, std::clamp(ly, 0, 255), std::clamp(rx, 0, 255), 128, buttons, 0.25);
+
+		// The turn's sign: half a second of turning one way while walking must turn the character that way; the other
+		// way twice in a row, and the sign flips (three times right: it stays).
+		if (learn) {
+			const int dir = std::abs(rx - 128) >= 64 && forward > 0 ? (rx > 128 ? 1 : -1) : 0;
+			if (dir == 0 || dir != learn_dir) {
+				learn_dir = dir;
+				learn_yaw = yaw;
+				learn_x   = px;
+				learn_z   = pz;
+				learn_t0  = now;
+			} else if (secs(now - learn_t0) >= 0.5) {
+				const double turned = RouteWrap(yaw - learn_yaw) * 180.0 / RoutePi;
+				if (RouteFlat(px, pz, learn_x, learn_z) >= 0.3 && std::abs(turned) >= 6.0) {
+					// rx right means turn > 0 (error > 0, the heading to raise) under `sign`: the yaw should have risen.
+					const bool right_way = (turned > 0) == (dir * sign > 0);
+					learn_wrong          = right_way ? 0 : learn_wrong + 1;
+					learn_right          = right_way ? learn_right + 1 : 0;
+					if (learn_wrong >= 2) {
+						sign        = -sign;
+						learn_wrong = 0;
+						std::printf("Route: the camera turns the other way: turn sign %+d\n", sign);
+					} else if (learn_right >= 3) {
+						learn = false;
+						std::printf("Route: turn sign %+d confirmed (KYTY_ROUTE_TURN_SIGN=%d skips the learning)\n", sign, sign);
+					}
+				}
+				learn_dir = 0;
+			}
+		}
+
+		if (secs(now - log_t) >= 1.0) {
+			log_t = now;
+			std::printf("Route: waypoint %zu/%zu part %d, %.1f m off the path, heading error %+.0f deg, forward %.2f, "
+			            "camera %+d%s%s\n",
+			            cursor, wps.size(), part, off, error_d, forward, rx - 128, standing ? ", standing" : "",
+			            learn ? ", learning the turn" : "");
+			std::fflush(stdout);
+		}
+	}
+}
+} // namespace
+
+bool HostInputStartRoute(const char* track_path) {
+	RouteData route;
+	if (track_path == nullptr || track_path[0] == '\0' || !LoadRoute(track_path, route)) return false;
+	const auto generation = g_route_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	std::thread(RouteThread, std::move(route), generation).detach();
+	return true;
+}
+
+void HostInputStopRoute() {
+	g_route_generation.fetch_add(1, std::memory_order_acq_rel);
+	ReleaseRouteInput();
+	std::printf("Route: stopped\n");
+	std::fflush(stdout);
+}
+
 void HostInputInit() {
 	StartScriptedInput();
 	StartTapeMarkerWatch();
 	GetInputMap();
+	if (const char* route = std::getenv("KYTY_ROUTE"); route != nullptr && route[0] != '\0') HostInputStartRoute(route);
 }
 
 void HostInputKey(int key_code, bool down) {

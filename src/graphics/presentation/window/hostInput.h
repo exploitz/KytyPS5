@@ -21,6 +21,11 @@ bool               HostInputReleaseMouse();
 void               HostInputFocus(bool gained);
 [[nodiscard]] bool HostInputMouseCaptured();
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);
+// The route walker (KYTY_ROUTE=<file.track> at start, the live `route`): the character walks a recorded track with stick
+// input (hostInput.cpp). False when the track cannot be read or has fewer than two waypoints; a new route replaces a
+// running one. Stop gives the pad back to the host.
+bool               HostInputStartRoute(const char* track_path);
+void               HostInputStopRoute();
 
 } // namespace Libs::Graphics
 

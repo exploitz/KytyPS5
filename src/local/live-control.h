@@ -16,11 +16,13 @@
 //   timecensus <seconds>          time-related HLE calls per guest caller (time-census.h)
 //   glide <x> <y> <z> <speed>     Demon's Souls 01.007.000: the player walks there (warp requests, no input)
 //   pad <lx> <ly> <rx> <ry> <buttons> <seconds>   scripted pad input (sticks 0..255, -1 the host's; buttons hex)
+//   route <file.track> | route off   Demon's Souls 01.007.000: the character walks a recorded track (hostInput.h)
 //   sleep <seconds>
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
 #include "common/assert.h"
 #include "frame-capture.h"
+#include "graphics/presentation/window/hostInput.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-trace.h"
@@ -622,6 +624,15 @@ inline void Run(uint64_t id, const std::string& line) {
 		                                   &buttons, &seconds) == 6;
 		if (parsed) Libs::Controller::SetScriptedInput(axes[0], axes[1], axes[2], axes[3], buttons, seconds);
 		std::printf("LIVE_PAD id=%" PRIu64 " ok=%d\n", id, parsed ? 1 : 0);
+	} else if (cmd == "route" && n >= 2) {
+		// route <file.track> | route off: the route walker starts (the rest of the line is the path: spaces allowed) or
+		// stops, the pad given back to the host.
+		auto path = line.substr(line.find("route") + 5);
+		path.erase(0, path.find_first_not_of(' '));
+		while (!path.empty() && (path.back() == '\r' || path.back() == ' ')) path.pop_back();
+		const bool off = path == "off";
+		const bool ok  = off ? (Libs::Graphics::HostInputStopRoute(), true) : Libs::Graphics::HostInputStartRoute(path.c_str());
+		std::printf("LIVE_ROUTE id=%" PRIu64 " path=%s ok=%d\n", id, off ? "off" : path.c_str(), ok ? 1 : 0);
 	} else if (cmd == "fatal") {
 		// fatal: a fatal error on this thread, the path a crash takes (log, then the process ends).
 		EXIT("live fatal: a test of the fatal-error exit\n");
