@@ -13,6 +13,12 @@
 #include "libs/padData.h"
 #include "loader/demonsSoulsWarp.h"
 
+#include <cstdlib>
+#include <string_view>
+#include <mutex>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -302,6 +308,7 @@ void GameController::Connect(int id) {
 	}
 
 	m_connected_ids.push_back(id);
+	std::printf("Controller: connected id=%d (%zu connected)\n", id, m_connected_ids.size());
 
 	CheckActive();
 }
@@ -318,6 +325,7 @@ void GameController::Disconnect(int id) {
 	}
 
 	m_connected_ids.erase(it);
+	std::printf("Controller: disconnected id=%d (%zu connected)\n", id, m_connected_ids.size());
 
 	CheckActive();
 }
@@ -607,6 +615,274 @@ void GameController::GetConnectionInfo(bool* flag, int* count) {
 	*count = m_connected_count;
 }
 
+// ---- input recording and replay ------------------------------------------------------------
+// One record per pad read: microseconds since the recording started, buttons, the six axes.
+// The replay is driven by the recording's clock, so it reproduces what the player did in wall
+// time regardless of how long loading took; it cannot make a game with a variable time step land
+// in exactly the same spot, but it reproduces the same path through the same places.
+namespace {
+#pragma pack(push, 1)
+struct InputRecord {
+	uint32_t dt_us;
+	uint32_t buttons;
+	uint8_t  axes[6];
+};
+#pragma pack(pop)
+std::mutex                g_input_tape_mutex;
+FILE*                     g_record_file  = nullptr;
+uint64_t                  g_record_t0    = 0;
+std::vector<InputRecord>  g_replay;
+size_t                    g_replay_index = 0;
+uint64_t                  g_replay_t0    = 0;
+bool                      g_replay_loaded = false, g_replay_running = false, g_replay_done = false;
+uint32_t                  g_replay_poll  = 0;
+struct TapeMarker {
+	uint64_t    dt_us = 0;
+	std::string kind;
+};
+std::vector<TapeMarker> g_markers;
+bool                    g_markers_loaded = false;
+size_t                  g_marker_next    = 0;
+// The replay waits at a mark (neutral input, the clock held) until the live run reaches the same moment: a load or
+// cutscene shorter than the recording's would otherwise play the presses after the mark early, then again after
+// NoteMarker moved the tape back.
+bool                    g_replay_waiting = false;
+uint64_t                g_replay_wait_t0 = 0; // when the wait began: a mark the live run never reaches is released after a while
+
+uint64_t InputNowUs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void LoadMarkersOnce() {
+	if (g_markers_loaded) return;
+	g_markers_loaded = true;
+	const char* path = std::getenv("KYTY_INPUT_REPLAY");
+	if (path == nullptr || path[0] == 0) return;
+	if (FILE* f = std::fopen((std::string(path) + ".marks").c_str(), "rb"); f != nullptr) {
+		char line[256];
+		while (std::fgets(line, sizeof(line), f) != nullptr) {
+			char* tab = std::strchr(line, '\t');
+			if (tab == nullptr) continue;
+			*tab = 0;
+			std::string name(tab + 1);
+			while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
+			g_markers.push_back({std::strtoull(line, nullptr, 10), std::move(name)});
+		}
+		std::fclose(f);
+	}
+	std::printf("Input replay: %zu mark(s)\n", g_markers.size());
+}
+
+void LoadReplayOnce() {
+	if (g_replay_loaded) return;
+	g_replay_loaded = true;
+	const char* path = std::getenv("KYTY_INPUT_REPLAY");
+	if (path == nullptr || path[0] == 0) return;
+	FILE* f = std::fopen(path, "rb");
+	if (f == nullptr) {
+		std::printf("Input replay: cannot open %s\n", path);
+		return;
+	}
+	InputRecord r {};
+	while (std::fread(&r, sizeof(r), 1, f) == 1) g_replay.push_back(r);
+	std::fclose(f);
+	std::printf("Input replay: %zu records loaded from %s\n", g_replay.size(), path);
+	LoadMarkersOnce();
+	const char* start = std::getenv("KYTY_INPUT_REPLAY_START");
+	if (start != nullptr && std::string_view(start) == "now" && !g_replay.empty()) {
+		g_replay_running = true;
+		g_replay_t0      = InputNowUs();
+		std::printf("Input replay: started\n");
+	}
+}
+
+// Replay start trigger: a file the harness creates once the level has loaded.
+void PollReplayStart() {
+	if (g_replay_running || g_replay_done || g_replay.empty()) return;
+	if ((++g_replay_poll % 30) != 0) return; // ~twice a second at 60 reads/s
+	const char* start = std::getenv("KYTY_INPUT_REPLAY_START");
+	if (start == nullptr || start[0] == 0 || std::string_view(start) == "now") return;
+	if (FILE* f = std::fopen(start, "rb"); f != nullptr) {
+		std::fclose(f);
+		std::remove(start);
+		g_replay_running = true;
+		g_replay_t0      = InputNowUs();
+		std::printf("Input replay: started (%zu records)\n", g_replay.size());
+	}
+}
+
+// KYTY_INPUT_REPLAY_CLOCK=polls: the tape advances one record per pad read instead of by time (a record was written per
+// read, so the game sees the same state at the same read it did; a load that takes longer than it did cannot shift the
+// presses; the cap must match the recording's, the reads come at its rate).
+bool ReplayByPolls() {
+	static const bool polls = [] {
+		const char* value = std::getenv("KYTY_INPUT_REPLAY_CLOCK");
+		return value != nullptr && std::string_view(value) == "polls";
+	}();
+	return polls;
+}
+
+// Overrides the live state with the recorded one for this moment; false once the tape has ended.
+bool ApplyReplay(ControllerState& state) {
+	if (!g_replay_running) return false;
+	// A mark ahead: the tape stops there (neutral input, the clock held) until NoteMarker sees the live moment.
+	if (g_marker_next < g_markers.size()) {
+		const auto limit = g_markers[g_marker_next].dt_us;
+		const bool at_limit = ReplayByPolls() ? (g_replay_index + 1 < g_replay.size() && g_replay[g_replay_index + 1].dt_us >= limit)
+		                                      : (InputNowUs() - g_replay_t0 >= limit);
+		if (at_limit) {
+			if (!g_replay_waiting) {
+				g_replay_waiting = true;
+				g_replay_wait_t0 = InputNowUs();
+				std::printf("Input replay: waiting at the %s mark (%.1f s)\n", g_markers[g_marker_next].kind.c_str(), limit / 1e6);
+				std::fflush(stdout);
+			} else if (InputNowUs() - g_replay_wait_t0 > 20000000) {
+				// (A dip the recording had and this run has not: the mark is let go and the tape runs on.)
+				std::printf("Input replay: the %s mark (%.1f s) did not come in 20 s: going on\n", g_markers[g_marker_next].kind.c_str(), limit / 1e6);
+				std::fflush(stdout);
+				g_marker_next++;
+				g_replay_waiting = false;
+				g_replay_t0      = InputNowUs() - limit;
+				return true;
+			}
+			g_replay_t0 = InputNowUs() - limit;
+			state.buttons = 0;
+			for (int i = 0; i < 4; i++) state.axes[i] = 128;
+			state.axes[4] = state.axes[5] = 0;
+			return true;
+		}
+	}
+	if (ReplayByPolls()) {
+		if (g_replay_index + 1 < g_replay.size()) {
+			g_replay_index++;
+		} else {
+			g_replay_running = false;
+			g_replay_done    = true;
+			std::printf("Input replay: finished (%zu reads)\n", g_replay.size());
+			std::fflush(stdout);
+			return false;
+		}
+		const auto& r = g_replay[g_replay_index];
+		state.buttons = r.buttons;
+		for (int i = 0; i < 6; i++) state.axes[i] = r.axes[i];
+		return true;
+	}
+	const auto t = InputNowUs() - g_replay_t0;
+	while (g_replay_index + 1 < g_replay.size() && g_replay[g_replay_index + 1].dt_us <= t) {
+		g_replay_index++;
+	}
+	if (g_replay_index + 1 >= g_replay.size() && t > g_replay.back().dt_us + 500000) {
+		g_replay_running = false;
+		g_replay_done    = true;
+		std::printf("Input replay: finished\n");
+		std::fflush(stdout);
+		return false;
+	}
+	const auto& r = g_replay[g_replay_index];
+	state.buttons = r.buttons;
+	for (int i = 0; i < 6; i++) state.axes[i] = r.axes[i];
+	return true;
+}
+
+void RecordState(const ControllerState& state) {
+	if (g_record_file == nullptr) return;
+	InputRecord r {};
+	r.dt_us   = static_cast<uint32_t>(std::min<uint64_t>(InputNowUs() - g_record_t0, UINT32_MAX));
+	r.buttons = state.buttons;
+	for (int i = 0; i < 6; i++) r.axes[i] = static_cast<uint8_t>(std::clamp(state.axes[i], 0, 255));
+	std::fwrite(&r, sizeof(r), 1, g_record_file);
+	std::fflush(g_record_file); // a crash must not lose the tape
+}
+} // namespace
+
+std::string RecordingTapePath() {
+	std::lock_guard lock(g_input_tape_mutex);
+	const char*     path = std::getenv("KYTY_INPUT_RECORD");
+	return g_record_file != nullptr && path != nullptr ? std::string(path) : std::string();
+}
+
+std::string ReplayTapePath() {
+	std::lock_guard lock(g_input_tape_mutex);
+	const char*     path = std::getenv("KYTY_INPUT_REPLAY");
+	return path != nullptr && path[0] != 0 && !g_replay_done ? std::string(path) : std::string();
+}
+
+void NoteMarker(const char* kind) {
+	std::lock_guard lock(g_input_tape_mutex);
+	const auto      now = InputNowUs();
+	if (g_record_file != nullptr) {
+		if (const char* path = std::getenv("KYTY_INPUT_RECORD"); path != nullptr) {
+			if (FILE* f = std::fopen((std::string(path) + ".marks").c_str(), "ab"); f != nullptr) {
+				std::fprintf(f, "%llu\t%s\n", static_cast<unsigned long long>(now - g_record_t0), kind);
+				std::fclose(f);
+			}
+		}
+		std::printf("Input recording: mark %s at %.1f s\n", kind, static_cast<double>(now - g_record_t0) / 1e6);
+		std::fflush(stdout);
+	}
+	if (!g_replay_running) return;
+	LoadMarkersOnce();
+	for (size_t i = g_marker_next; i < g_markers.size(); i++) {
+		if (g_markers[i].kind != kind) continue;
+		const auto dt   = g_markers[i].dt_us;
+		g_marker_next   = i + 1;
+		g_replay_t0     = now - dt;
+		g_replay_waiting = false;
+		size_t index    = 0;
+		while (index + 1 < g_replay.size() && g_replay[index + 1].dt_us <= dt) index++;
+		std::printf("Input replay: mark %s: the tape moves from %.1f to %.1f s\n", kind,
+		            g_replay_index < g_replay.size() ? g_replay[g_replay_index].dt_us / 1e6 : 0.0, dt / 1e6);
+		std::fflush(stdout);
+		g_replay_index = index;
+		return;
+	}
+	std::printf("Input replay: mark %s with no recorded one left\n", kind);
+	std::fflush(stdout);
+}
+
+uint64_t TapeTimeUs() {
+	std::lock_guard lock(g_input_tape_mutex);
+	if (g_record_file != nullptr && !g_replay_running) return InputNowUs() - g_record_t0;
+	if (!g_replay_running || g_replay_waiting) return 0;
+	if (ReplayByPolls()) return g_replay_index < g_replay.size() ? g_replay[g_replay_index].dt_us : 0;
+	return InputNowUs() - g_replay_t0;
+}
+
+bool ReplayPlaying() {
+	std::lock_guard lock(g_input_tape_mutex);
+	return g_replay_running && !g_replay_waiting;
+}
+
+void ToggleRecording() {
+	std::lock_guard lock(g_input_tape_mutex);
+	if (g_record_file != nullptr) {
+		std::fclose(g_record_file);
+		g_record_file = nullptr;
+		std::printf("Input recording: stopped\n");
+		std::fflush(stdout);
+		return;
+	}
+	const char* path = std::getenv("KYTY_INPUT_RECORD");
+	if (path == nullptr || path[0] == 0) {
+		std::printf("Input recording: set KYTY_INPUT_RECORD=<file> to record\n");
+		std::fflush(stdout);
+		return;
+	}
+	{
+		// (The launcher names a tapes folder that need not exist yet.)
+		std::error_code error;
+		std::filesystem::create_directories(std::filesystem::path(path).parent_path(), error);
+	}
+	// (The side files append: a tape name used again, last-<tag>.tape, starts them afresh too.)
+	for (const char* side: {".ime", ".marks", ".track"}) std::remove((std::string(path) + side).c_str());
+	g_record_file = std::fopen(path, "wb");
+	g_record_t0   = InputNowUs();
+	std::printf("Input recording: %s %s\n", g_record_file != nullptr ? "started ->" : "cannot open", path);
+	std::fflush(stdout);
+}
+
 void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 	EXIT_IF(flag == nullptr);
 	EXIT_IF(count == nullptr);
@@ -617,6 +893,25 @@ void GameController::ReadState(ControllerState* state, bool* flag, int* count) {
 	*flag  = m_connected;
 	*count = m_connected_count;
 	*state = m_state;
+	// KYTY_INPUT_RECORD names the tape of this run: the recording starts with the first read (F9 stops and restarts it;
+	// KYTY_INPUT_RECORD_AUTO=0 leaves the start to F9, as before). Every play session leaves a tape to replay.
+	static const bool auto_record = [] {
+		const char* path = std::getenv("KYTY_INPUT_RECORD");
+		const char* mode = std::getenv("KYTY_INPUT_RECORD_AUTO");
+		if (path != nullptr && path[0] != 0 && (mode == nullptr || mode[0] != '0')) ToggleRecording();
+		return true;
+	}();
+	(void)auto_record;
+	{
+		std::lock_guard tape(g_input_tape_mutex);
+		LoadReplayOnce();
+		PollReplayStart();
+		if (ApplyReplay(*state)) {
+			m_state.buttons = state->buttons; // the live state follows the tape (ReadStates too)
+			std::copy_n(state->axes, 6, m_state.axes);
+		}
+		RecordState(*state);
+	}
 }
 
 int GameController::ReadStates(ControllerState* states, int states_num, bool* flag, int* count) {

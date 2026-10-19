@@ -41,11 +41,14 @@
 #include "graphics/presentation/window/startupProgress.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "frame-gen.h"
+#include "fsr-frame-gen.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <string_view>
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -76,7 +79,27 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
+// KYTY_PAD_FACE=swap: the face buttons by position when SDL mapped a Nintendo-labelled pad by
+// its labels (A on the right, B at the bottom): the bottom button is Cross, the right one Circle,
+// the left Square, the top Triangle, as on the DualSense.
+static bool PadFaceSwapped() {
+	static const bool swapped = [] {
+		const char* value = std::getenv("KYTY_PAD_FACE");
+		return value != nullptr && std::string_view(value) == "swap";
+	}();
+	return swapped;
+}
+
 static uint32_t ControllerButtonToPadButton(int button) {
+	if (PadFaceSwapped()) {
+		switch (button) {
+			case SDL_CONTROLLER_BUTTON_A: return Controller::PAD_BUTTON_CIRCLE;
+			case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CROSS;
+			case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_TRIANGLE;
+			case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_SQUARE;
+			default: break;
+		}
+	}
 	switch (button) {
 		case SDL_CONTROLLER_BUTTON_A: return Controller::PAD_BUTTON_CROSS;
 		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
@@ -248,7 +271,9 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			// Pause on the Pause/Break key (ours; chen's Space): Space sat next to the movement keys and got hit mid-fight,
+			// and the keyboard layout binds it.
+			case SDLK_PAUSE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
 			// F9: a debug snapshot of the picture shown (src/local/debug-snapshot.h), the game paused; F9 again resumes.
 			case SDLK_F9:
 				if (!key.repeat) {
@@ -267,6 +292,27 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 			case SDLK_F8:
 				if (!key.repeat) {
 					PerfOverlay::CycleLevel();
+				}
+				break;
+			// F6: a 30 s measure of this spot (fps, 1% low, p99, worst frame), through the live-control file
+			// (KYTY_LIVE_FILE); the launcher records it under the area name it shows.
+			case SDLK_F6:
+				if (!key.repeat) {
+					if (const char* live = std::getenv("KYTY_LIVE_FILE"); live != nullptr && *live != '\0') {
+						static uint64_t next_id = 900000;
+						if (FILE* f = std::fopen(live, "wb"); f != nullptr) {
+							std::fprintf(f, "id %llu\r\nmeasure 30 f6\r\n", static_cast<unsigned long long>(++next_id));
+							std::fclose(f);
+							std::printf("F6: measuring 30 s\n");
+							std::fflush(stdout);
+						}
+					}
+				}
+				break;
+			// F5: the player's position appended to a route file (automated tours replay it).
+			case SDLK_F5:
+				if (!key.repeat) {
+					Loader::DemonsSoulsWarp::RecordWaypoint();
 				}
 				break;
 			case SDLK_F11:
@@ -317,6 +363,10 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 	}
 #endif
 
+	if (mb.wheel && !mb.touch) {
+		HostInputMouseWheel(mb.y);
+		return;
+	}
 	if (mb.down || mb.up) {
 		uint8_t mouse_button = 0;
 		if (mb.left) {
@@ -488,9 +538,11 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			break;
 		case SDL_WINDOWEVENT_FOCUS_GAINED:
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
+			HostInputFocus(true);
 			break;
 		case SDL_WINDOWEVENT_FOCUS_LOST:
 			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
+			HostInputFocus(false);
 			break;
 		case SDL_WINDOWEVENT_CLOSE:
 			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
@@ -537,6 +589,19 @@ void WindowContext::ProcessEvent(double time_s) {
 	    event->key.keysym.sym == SDLK_F7) {
 		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
 			HostInputToggleMouseToJoystick();
+		}
+		return;
+	}
+	// Esc frees the mouse from the camera (held: the key goes no further).
+	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) && event->key.keysym.sym == SDLK_ESCAPE &&
+	    HostInputMouseCaptured()) {
+		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) HostInputReleaseMouse();
+		return;
+	}
+	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) &&
+	    event->key.keysym.sym == SDLK_F9 && std::getenv("KYTY_INPUT_RECORD") != nullptr) {
+		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
+			Libs::Controller::ToggleRecording();
 		}
 		return;
 	}
@@ -767,6 +832,21 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+void WindowContext::PostToMainThread(std::function<void()> task) {
+	if (Common::Thread::IsMainThread()) {
+		task();
+		return;
+	}
+	{
+		Common::LockGuard lock(main_task_mutex);
+		main_tasks.push_back(std::move(task));
+		++main_tasks_queued;
+	}
+	SDL_Event event {};
+	event.type = SDL_USEREVENT;
+	SDL_PushEvent(&event);
+}
+
 void WindowContext::RunOnMainThread(std::function<void()> task) {
 	if (Common::Thread::IsMainThread()) {
 		task();
@@ -843,6 +923,12 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+	// Face buttons by position, not by the pad's printed labels: SDL otherwise maps a Nintendo
+	// layout so that its bottom button (B) is SDL's B (Circle), the reverse of the DualSense.
+	// KYTY_PAD_FACE=labels keeps SDL's label mapping; =swap swaps the four by hand.
+	if (const char* face = std::getenv("KYTY_PAD_FACE"); face == nullptr || std::string_view(face) != "labels") {
+		SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 	// Pixel-exact windows and swapchains on scaled displays: without per-monitor awareness a
@@ -902,6 +988,7 @@ static void WindowCreate(WindowContext& context) {
 	// KYTY_FRAMEGEN: Streamline must be initialized before SDL loads Vulkan with the window, and
 	// then becomes that loader (the instance and device are created through it).
 	Libs::Graphics::FrameGen::Initialize();
+	Libs::Graphics::FsrFrameGen::Initialize();
 #endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
 	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
@@ -1072,24 +1159,35 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
-	if (now - fps_start >= frequency) {
-		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
-		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
+	HostInputNotePresentedFrame();
+	// The title changes once a second (with the fps), and the present thread does not wait for the main
+	// thread to set it: it waited every present (upstream PR #1013 and #1076 found the same stall).
+	if (now - fps_start < frequency) {
+		return;
 	}
+	current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
+	              static_cast<double>(now - fps_start);
+	fps_start   = now;
+	fps_frames  = 0;
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	// With frame generation the fps above counts the game's own frames; the frames shown follow it.
+	const uint32_t shown = FsrFrameGen::Enabled() ? FsrFrameGen::PresentedFrames()
+	                       : FrameGen::Enabled()  ? FrameGen::PresentedFrames()
+	                                              : 1u;
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}{}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, current_fps,
+	    shown > 1 ? fmt::format(", shown: {:.0f} ({} frame generation {}x)", current_fps * shown,
+	                            FsrFrameGen::Enabled() ? "FSR" : "DLSS", shown)
+	              : std::string {});
 	if (const auto waypoints = Loader::DemonsSoulsWarp::RecordedWaypoints(); waypoints != 0) {
 		text += fmt::format(", waypoints: {}", waypoints);
 	}
 
-	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
+	PostToMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }
 
 } // namespace Libs::Graphics

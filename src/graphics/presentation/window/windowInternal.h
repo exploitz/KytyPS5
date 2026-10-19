@@ -50,6 +50,8 @@ struct WindowContext {
 	void Run();
 	// SDL window operations must complete on the main thread.
 	void RunOnMainThread(std::function<void()> task);
+	// Queued for the main thread without waiting for it to run.
+	void PostToMainThread(std::function<void()> task);
 	void DrainMainThreadTasks();
 
 	GraphicContext                 graphic_ctx;

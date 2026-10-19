@@ -404,6 +404,22 @@ double Glide(float x, float y, float z, float speed) {
 #endif
 }
 
+bool PlayerPosition(float xyz[3], float* yaw) {
+#if defined(_WIN32)
+	uint64_t ctrl = 0, body = 0;
+	float    angles[4] {}, position[3] {}; // (Peek reads sizeof(*out): the arrays, not their first float)
+	if (!IsPlayerBuild() || !FindPlayer(&ctrl, &body) || !Peek(body + 0x10, &angles) || !Peek(body + 0x20, &position) ||
+	    !std::isfinite(position[0]) || !std::isfinite(position[1]) || !std::isfinite(position[2]))
+		return false;
+	std::copy_n(position, 3, xyz);
+	if (yaw != nullptr) *yaw = angles[1];
+	return true;
+#else
+	(void)xyz, (void)yaw;
+	return false;
+#endif
+}
+
 void RecordWaypoint() {
 	float xyz[3] {}, angles[4] {};
 	bool  found = false;

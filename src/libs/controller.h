@@ -3,6 +3,8 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+
+#include <string>
 namespace Libs::Controller {
 
 void Initialize();
@@ -86,6 +88,24 @@ void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void ResetInputState();
+// Input recording and replay (KYTY_INPUT_RECORD=<file>, KYTY_INPUT_REPLAY=<file>): F9 starts and
+// stops a recording of the pad state the game reads; a replay starts when the file named by
+// KYTY_INPUT_REPLAY_START appears next to the emulator (the harness drops it once the level has
+// loaded) or at once with KYTY_INPUT_REPLAY_START=now, and plays the recorded states back on the
+// recording's own clock, then hands control back to the live pad.
+void ToggleRecording();
+// The tape being recorded, and the one being replayed (empty: none): input the game takes through dialogs (the IME's
+// text) is kept beside the tape as <tape>.ime (imeDialog.cpp), so a replay types what the player typed.
+std::string RecordingTapePath();
+std::string ReplayTapePath();
+// Sync marks (<tape>.marks: "<dt_us>\t<kind>" lines): a recording notes the moments its play reached (gameplay drawn
+// again after a load, menu or cutscene: "level"; a dialog answered: "dialog"); a replay meeting the same moment moves
+// the tape to that mark, so a load longer or shorter than the recording's shifts no press. Does whichever applies.
+void NoteMarker(const char* kind);
+// The tape's clock now: recording, the time since it started; replaying, the tape time the reads are at (0 when
+// neither runs or the replay waits at a mark). Tracks (<tape>.track, hostInput.cpp) are kept and followed by it.
+uint64_t TapeTimeUs();
+bool     ReplayPlaying();
 // Scripted input (live `pad`, automated tours): for `seconds` from now the game reads these stick values (0..255, 128
 // centre; -1: the host's) and these buttons OR-ed into the host's.
 void SetScriptedInput(int left_x, int left_y, int right_x, int right_y, uint32_t buttons, double seconds);
