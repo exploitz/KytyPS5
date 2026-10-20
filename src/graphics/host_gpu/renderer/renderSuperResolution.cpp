@@ -279,7 +279,7 @@ void RunUpscale(const UpscaleRecord& record, const vk::detail::DispatchLoaderDyn
 		record.command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, record.timing->pool, first + index, dispatch);
 	};
 	stamp(0);
-	const bool upscaled = FrameGen::Upscale(record.command, record.inputs);
+	const bool upscaled = FrameGen::Upscale(record.command, record.inputs, dispatch);
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::InvalidateReplayState(); // (what DLSS bound)
 #endif
@@ -389,6 +389,8 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 		out.format = binding.desc.view_info.format;
 		out.extent = extent(binding, image);
 		out.usage  = image.backing.usage;
+		out.base_level = binding.desc.view_info.base_level;
+		out.base_layer = binding.desc.view_info.base_layer;
 		return out;
 	};
 	UpscaleRecord record;

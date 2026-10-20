@@ -34,8 +34,8 @@ void Install(Program* program) {
 		return;
 	// (The device exists by now: without DLSS on it, the game's own TAA rather than a stretch without anti-aliasing.)
 	if (!Libs::Graphics::FrameGen::UpscalerReady()) {
-		std::printf("Demon's Souls super resolution: DLSS is not available here (an NVIDIA RTX GPU and NVIDIA's Streamline "
-		            "runtime); the game's own TAA kept\n");
+		std::printf("Demon's Souls super resolution: DLSS is not available here (an NVIDIA RTX GPU and NVIDIA's DLSS "
+		            "runtime: Streamline on Windows, libkyty_dlss.so on Linux); the game's own TAA kept\n");
 		return;
 	}
 	const auto site = GuestCode::FindUnique(*program, GuestCode::Pattern(CreateCheck));

@@ -143,6 +143,8 @@ bool QueryAdapterVideoMemory(uint64_t* in_use);
 // The file's Authenticode signature is valid (no network: revocation not checked) and its signer is NVIDIA
 // Corporation: NVIDIA's DLLs the emulator loads (Streamline for frame generation, DLSS). false elsewhere.
 bool IsNvidiaSigned(const std::wstring& path);
+// The same for AMD's (Advanced Micro Devices: the FidelityFX runtime, KYTY_FRAMEGEN_BACKEND=fsr).
+bool IsAmdSigned(const std::wstring& path);
 
 #if defined(_WIN32)
 // With its output in files (run-windows.ps1's logs), the console window a launcher gave the process

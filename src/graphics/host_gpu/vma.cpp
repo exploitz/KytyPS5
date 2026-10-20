@@ -25,6 +25,8 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "frame-gen.h"
 #include "live-counters.h"
 #include "local-platform.h"
 
@@ -153,7 +155,30 @@ bool GraphicContext::CreateAllocator() {
 		physical_device.getProperties2(&device_properties);
 		if (id.deviceLUIDValid) (void)LocalPlatform::OpenVideoMemoryAdapter(id.deviceLUID.data());
 	}
-	small_video_memory = GetTotalMemoryBudget() < (uint64_t {12} << 30u);
+	// KYTY_FRAMEGEN_BACKEND=fsr: FidelityFX's own allocations (about 1.3 GiB at 2560x1440: interpolation, optical flow,
+	// its swapchain; outside this allocator but in its budget) leave the game that much less, so a budget short of 12 GiB
+	// after them counts as small (a 16 GB card whose budget other programs had cut to 12.2 GiB ran out with FSR).
+	const uint64_t reserved =
+	    Libs::Graphics::FrameGen::UsesFsr() ? Libs::Graphics::FrameGen::FsrVideoMemoryReserve() : 0;
+	small_video_memory      = GetTotalMemoryBudget() < (uint64_t {12} << 30u) + reserved;
+	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
+	// for big ones, as in the default pools).
+	if (const char* defrag = std::getenv("KYTY_BUFFER_DEFRAG");
+	    defrag == nullptr ? small_video_memory : std::strcmp(defrag, "0") != 0) {
+		VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		buffer.size  = uint64_t {64} << 10u;
+		buffer.usage = static_cast<VkBufferUsageFlags>(AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress);
+		VmaAllocationCreateInfo allocation {};
+		allocation.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		uint32_t type    = 0;
+		VmaPoolCreateInfo pool {};
+		if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &buffer, &allocation, &type) == VK_SUCCESS) {
+			pool.memoryTypeIndex = type;
+			if (vmaCreatePool(allocator, &pool, &game_buffer_pool) != VK_SUCCESS) game_buffer_pool = nullptr;
+		}
+		std::printf("Game buffers: %s\n", game_buffer_pool != nullptr ? "own pool, compacted (KYTY_BUFFER_DEFRAG=0 turns it off)"
+		                                                               : "pool failed, default pools");
+	}
 	LogVideoMemory("start");
 	g_report_allocator          = allocator;
 	g_report_context            = this;
@@ -173,6 +198,13 @@ void GraphicContext::DestroyAllocator() {
 	g_report_context           = nullptr;
 	FlushBufferReclaimer();
 	DestroyImagePool(allocator);
+	if (game_buffer_pool != nullptr) {
+		// (Only empty: a buffer still alive frees its memory into it later.)
+		VmaStatistics statistics {};
+		vmaGetPoolStatistics(allocator, game_buffer_pool, &statistics);
+		if (statistics.allocationCount == 0) vmaDestroyPool(allocator, game_buffer_pool);
+		game_buffer_pool = nullptr;
+	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 	for (const auto memory: simulation_ballast) device.freeMemory(memory);

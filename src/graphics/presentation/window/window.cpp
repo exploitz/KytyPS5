@@ -983,9 +983,10 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 	// KYTY_FRAMEGEN: Streamline must be initialized before SDL loads Vulkan with the window, and
-	// then becomes that loader (the instance and device are created through it).
+	// then becomes that loader (the instance and device are created through it). Linux: KYTY_UPSCALER=dlss loads
+	// the NGX bridge (libkyty_dlss.so) here, before the instance it adds extensions to.
 	Libs::Graphics::FrameGen::Initialize();
 #endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
