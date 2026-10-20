@@ -940,6 +940,8 @@ struct PipelineCache::ProgramCache {
 		                        "KYTY_EXEC_DEMAND", "KYTY_LANE_LOCAL", "KYTY_LANE_LOCAL_TITLE", "KYTY_LANE_LOCAL_UNIFORM_LOADS",
 		                        "KYTY_PS_WAVE_OR"}) {
 			const char* value = std::getenv(name);
+			// (The shader fix by its effect: unset and 1 translate alike since it is on by default.)
+			if (std::string_view(name) == "KYTY_EXEC_DEMAND") value = ShaderRecompiler::IR::ExecDemandEnabled() ? "1" : "0";
 			text += fmt::format("{}={};", name, value != nullptr ? value : "");
 		}
 		return text;

@@ -654,7 +654,7 @@ uint32_t Analysis::Apply() {
 bool ExecDemandEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_EXEC_DEMAND");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
 }
