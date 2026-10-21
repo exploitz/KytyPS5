@@ -40,7 +40,7 @@ if (!(Test-Path "$tape.track")) { "no track was recorded ($tape.track)"; exit 1 
 "recorded: $((Get-Content "$tape.track").Count) track points over $seconds s"
 
 # 2. The walk: the same spot, KYTY_ROUTE on the track; screenshots while it walks.
-python tools\local\bench-windows.py reset | Out-Null
+# (bench-run.ps1 puts a fresh bench save in itself; a second reset in the same second fails on its folder name.)
 Launch @("KYTY_ROUTE=$tape.track")
 for ($t = 5; $t -le [int]($seconds * 2 + 20); $t += 5) {
 	Start-Sleep 5

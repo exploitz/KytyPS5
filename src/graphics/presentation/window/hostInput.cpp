@@ -552,6 +552,7 @@ static void StartScriptedInput() {
 	if (steps.empty()) {
 		return;
 	}
+	FrameGen::g_gameplay_draws_wanted.store(true, std::memory_order_relaxed);
 	std::thread([steps, start_file, stop_file] {
 		const auto t0 = std::chrono::steady_clock::now();
 		std::vector<double> next(steps.size());
@@ -699,6 +700,7 @@ static void StartTapeMarkerWatch() {
 	const char* record = std::getenv("KYTY_INPUT_RECORD");
 	const char* replay = std::getenv("KYTY_INPUT_REPLAY");
 	if (record == nullptr && replay == nullptr) return;
+	FrameGen::g_gameplay_draws_wanted.store(true, std::memory_order_relaxed);
 	const double max_m = [] {
 		const char* value = std::getenv("KYTY_TAPE_TRACK_M");
 		return value != nullptr && value[0] != '\0' ? std::atof(value) : 2.0;
@@ -944,6 +946,9 @@ void RouteThread(RouteData route, uint64_t generation) {
 			draws_before  = draws;
 			draws_changed = now;
 		}
+		// Nothing of the game drawn yet: KYTY_ROUTE starts the walker with the input, long before the game's code and
+		// memory are there (reading the player then ended the process: 10-21, three launches in a row).
+		if (draws == 0) continue;
 		float      xyz[3] {}, yaw_f = 0;
 		const bool player = Loader::DemonsSoulsWarp::PlayerPosition(xyz, &yaw_f);
 		// Loads, menus, cutscenes: no player, or no gameplay drawn for half a second.
@@ -1154,6 +1159,7 @@ bool HostInputStartRoute(const char* track_path) {
 	RouteData route;
 	if (track_path == nullptr || track_path[0] == '\0' || !LoadRoute(track_path, route)) return false;
 	const auto generation = g_route_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	FrameGen::g_gameplay_draws_wanted.store(true, std::memory_order_relaxed);
 	std::thread(RouteThread, std::move(route), generation).detach();
 	return true;
 }

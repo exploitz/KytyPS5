@@ -491,6 +491,8 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	}
 	if (pair.respecialize) TableReset(pair);
 	if (pair.refused) return TableResult::Native;
+	if (FrameGen::g_gameplay_draws_wanted.load(std::memory_order_relaxed) && pair.programs[0] != nullptr)
+		FrameGen::NoteGameplayDraw(pair.programs[0]->shader_hash);
 	// KYTY_FRAMEGEN: the frame's first G-buffer draw goes the normal way (or a native record's), whose hook reads the
 	// camera from its constants.
 	if (FrameGen::Enabled() && pair.programs[0] != nullptr &&

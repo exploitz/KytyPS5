@@ -33,6 +33,10 @@ constexpr std::array<uint64_t, 6> GbufferVertexShaders {0xf4d2e78cd1769fc7ULL, 0
 // Draws of the G-buffer vertex shaders since start: 3D gameplay is on screen (the harness and the
 // scripted input use it to tell the level from menus, movies and loading screens).
 inline std::atomic<uint64_t> g_gameplay_draws {0};
+// Set while something reads g_gameplay_draws (the route walker, input tapes and scripts): then table draws count too
+// (table-xpr.inc TableTry); otherwise that path pays one relaxed load. (Chen's table mode draws the G-buffer itself:
+// counted on the normal path alone, the count stopped once the scene's draws were all tables.)
+inline std::atomic<bool> g_gameplay_draws_wanted {false};
 inline void NoteGameplayDraw(uint64_t vs_hash) {
 	if (std::find(GbufferVertexShaders.begin(), GbufferVertexShaders.end(), vs_hash) != GbufferVertexShaders.end())
 		g_gameplay_draws.fetch_add(1, std::memory_order_relaxed);
