@@ -1,7 +1,7 @@
 param([string]$Label = 'ab', [string]$Plan = 'w:down:0,w:up:10000',
       [string]$Symbol = '', [string]$A = '0', [string]$B = '1',
       [int]$Rounds = 4, [double]$Seconds = 6, [string[]]$Set = @(), [switch]$KeepRunning,
-      [int]$Attempts = 3, [double]$MaxFps = 55)
+      [int]$Attempts = 3, [double]$MaxFps = 55, [int]$Vblank = 0, [int]$Width = 0, [int]$Height = 0)
 # Same-process A/B at one place of the walk route: launch (bench-run.ps1), walk -Plan and stop
 # there, then switch a 32-bit variable (a kyty_local_* switch, by its linker-map address) between
 # the hex values -A and -B with the live poke32 command, measuring one window per setting in
@@ -20,6 +20,9 @@ if (!$entry) { "symbol $Symbol not in $map"; exit 1 }
 $address = '{0:x}' -f (0x140000000 + [Convert]::ToUInt64(($entry.Line.Trim() -split '\s+')[0], 16))
 $params = @{ Label = $Label; KeepRunning = $true; NoWalk = $true; ShotOnly = $true }
 if ($Set.Count) { $params['Set'] = $Set }
+# -Vblank 120: no 60 fps ceiling; -Width/-Height: the output size (a GPU-bound A/B at 3840x2160).
+if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
+if ($Width -gt 0 -and $Height -gt 0) { $params['Width'] = $Width; $params['Height'] = $Height }
 # The walk sometimes ends facing a wall of the tunnel (a light spot at the 60 fps cap): walk again
 # from a fresh start then, up to -Attempts times (-MaxFps 0 keeps the first spot).
 for ($attempt = 1; $attempt -le $Attempts; $attempt++) {

@@ -983,6 +983,13 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 
 } // namespace
 
+bool LaneLocalTitleProgram(uint64_t hash) {
+	// The tile lighting (three) and the 214x120x72 fog volume.
+	constexpr std::array<uint64_t, 4> Title {0x7e676bf37482d768ull, 0xdecd2b04b5eee050ull, 0xa3ecbeb1830c210cull,
+	                                         0xf0dc79c3467d5e0bull};
+	return std::find(Title.begin(), Title.end(), hash) != Title.end();
+}
+
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options) {
 	ValidateTranslateOptions(options);
@@ -1023,14 +1030,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		// The proof refused these four; lane-local, a half walks the union of its own lanes' light masks, which holds every
 		// light of each of its lanes (10-14: the lighting's GPU time 4.34 -> 3.42 ms at 1-1, pictures within noise). The
 		// cooperative halves above now take programs of this shape the exact way, so this list is for A/Bs against them.
-		static const bool title = [] {
-			const char* value = std::getenv("KYTY_LANE_LOCAL_TITLE");
-			return value != nullptr && value[0] == '1';
-		}();
-		constexpr std::array<uint64_t, 4> TitleLaneLocal {0x7e676bf37482d768ull, 0xdecd2b04b5eee050ull, 0xa3ecbeb1830c210cull,
-		                                                  0xf0dc79c3467d5e0bull};
-		if (!result.lane_local && enabled && title &&
-		    std::find(TitleLaneLocal.begin(), TitleLaneLocal.end(), options.shader_hash) != TitleLaneLocal.end()) {
+		// (KYTY_LANE_LOCAL_TITLE: CompileOptions::lane_local_title.)
+		if (!result.lane_local && enabled && options.lane_local_title && LaneLocalTitleProgram(options.shader_hash)) {
 			result.lane_local = true;
 			reason            = "title list";
 		}

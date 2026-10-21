@@ -2,7 +2,7 @@ param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [string[]]$Ex
       [switch]$KeepRunning, [string]$PresentMode = '', [int]$Vblank = 0, [string[]]$Set = @(),
       [string]$Patch = '', [switch]$Fullscreen, [switch]$Hdr, [switch]$ShotOnly, [switch]$NoWalk,
       [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '',
-      [string]$Game = '', [switch]$LoadGame)
+      [string]$Game = '', [switch]$LoadGame, [int]$Width = 0, [int]$Height = 0)
 # End to end: fresh baseline save, launch, skip to the game, walk the fixed path once the HUD
 # is really up, measure. Screen states are told apart by pixel statistics.
 $S = $PSScriptRoot
@@ -134,6 +134,8 @@ $params = @{}
 if ($Exe) { $params['Exe'] = $Exe }
 if ($PresentMode) { $params['PresentMode'] = $PresentMode }
 if ($Vblank -gt 0) { $params['Vblank'] = $Vblank }
+# -Width/-Height: the output size (run-windows.ps1's; 2560x1440 without them).
+if ($Width -gt 0 -and $Height -gt 0) { $params['Width'] = $Width; $params['Height'] = $Height }
 if ($Set.Count) { $params['Set'] = $Set }
 if ($Patch) { $params['Patch'] = $Patch }
 if ($Fullscreen) { $params['Fullscreen'] = $true }
@@ -149,7 +151,9 @@ function Restore-GamePath {
 }
 if ($Game) { $params['Game'] = $Game }
 # -NoPrecompile: the driver cache as it is (first-encounter measurements with KYTY_SHADER_WARMUP=0).
-if (!$NoPrecompile) { & "$root\run-windows.ps1" -Precompile -Width 1280 -Height 720 @params *> $null; Restore-GamePath }
+# (The precompile run at its own small size: the run's -Width/-Height left out of it.)
+$precompileParams = @{} + $params; $precompileParams.Remove('Width'); $precompileParams.Remove('Height')
+if (!$NoPrecompile) { & "$root\run-windows.ps1" -Precompile -Width 1280 -Height 720 @precompileParams *> $null; Restore-GamePath }
 $env:KYTY_LIVE_FILE = "$root\_Build\windows-bench\live-commands.txt"
 # The HUD is up about 60 s after launch: a start-up still short of it after -StartupSeconds is stuck
 # (seen once in the attract loop), so it starts again from a fresh baseline save.

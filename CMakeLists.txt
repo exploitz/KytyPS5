@@ -227,8 +227,9 @@ endif()
 
 # The host allocator behind operator new/delete (the render thread allocates per draw and dispatch). Chen's
 # Linux play setup preloads libmimalloc.so; on Windows it is linked in (10-06 A/B, PGO builds, still view:
-# 1-1 +2.2%, 1-2 +2.5%, Latria +1.4%; moving: 1-1 +4.7%, the Nexus -2.0%, within its noise).
-option(KYTY_MIMALLOC "operator new/delete from mimalloc (fetched, v2.5.2)" ON)
+# 1-1 +2.2%, 1-2 +2.5%, Latria +1.4%; moving: 1-1 +4.7%, the Nexus -2.0%, within its noise). Off by default since
+# 2026-10-21: on chen's v20261021 (the 120 Hz session, launches alternating) it measured 0.0% fps and -0.2% 1% low.
+option(KYTY_MIMALLOC "operator new/delete from mimalloc (fetched, v2.5.2)" OFF)
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")

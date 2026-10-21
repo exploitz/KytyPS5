@@ -38,7 +38,11 @@ struct TranslateOptions {
 	const ShaderPixelInputInfo*   pixel          = nullptr;
 	const ShaderComputeInputInfo* compute        = nullptr;
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
+	bool                          lane_local_title = false; // the title list's programs lane-local (Translate.cpp)
 };
+
+// The title list: Demon's Souls programs run lane-local by hash (CompileOptions::lane_local_title).
+bool LaneLocalTitleProgram(uint64_t hash);
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options);

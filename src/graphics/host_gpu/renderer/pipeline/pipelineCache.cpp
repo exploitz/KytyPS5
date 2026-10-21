@@ -443,6 +443,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 		bool                                         table_mode = false; // an empty handle: refused
+		bool                                         lane_title = false; // made lane-local by the title list (CompileOptions)
 	};
 
 	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file: zstd-compressed (spirv_bytes,
@@ -2135,6 +2136,10 @@ struct PipelineCache::ProgramCache {
 			// one program takes any), the snapshot it binds from padded alike (TableResolveSet).
 			(void)ShaderRecompiler::IR::TableIndirectForm(table_specialization, &resources.images);
 		};
+		// KYTY_LANE_LOCAL_TITLE=live: the title list's programs keep a permutation per side of the switch (the side
+		// switched to is translated here when first met; the prefetch's and the store's are the default side's).
+		const bool title_program = ShaderRecompiler::LaneLocalTitleLive() && ShaderRecompiler::LaneLocalTitleProgram(params.hash);
+		const bool title_on      = title_program && ShaderRecompiler::LaneLocalTitleLiveOn();
 		if (entry != programs.end()) {
 			const ShaderRecompiler::IR::ResourceSpecialization* borrowed_specialization = nullptr;
 			if (!ReportMaterialization(label, stage, params.hash, report,
@@ -2153,12 +2158,13 @@ struct PipelineCache::ProgramCache {
 			const auto find_permutation = [&] { return std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        return candidate.table_mode == table_mode && compatible_push_data(candidate) &&
-				               candidate.specialization == active_specialization;
+				               candidate.specialization == active_specialization &&
+				               (!title_program || candidate.lane_title == title_on);
 			        }); };
 			// A borrowed specialization comes from the guard: the permutation it
 			// selected under the same publication is still the right one.
 			auto& source = entry->second;
-			if (!table_mode && borrowed_specialization && source.guarded_permutation &&
+			if (!table_mode && !title_program && borrowed_specialization && source.guarded_permutation &&
 			    source.guarded_publication == source.specialization_guard.publication &&
 			    compatible_push_data(*source.guarded_permutation)) {
 				const auto* selected = source.guarded_permutation;
@@ -2211,13 +2217,15 @@ struct PipelineCache::ProgramCache {
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
 		}
+		if (title_program) options.lane_local_title = title_on;
 		// Table mode: a program the normal path compiled first, in the table form of its specialization, translated
 		// by a compile worker (table_pending until then); a refused one keeps an empty permutation.
 		if (table_mode) {
 			if (entry == programs.end()) return {};
 			auto&      jobs  = entry->second.table_jobs;
 			const auto found = std::ranges::find_if(jobs, [&](const auto& job) {
-				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization;
+				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization &&
+				       job->options.lane_local_title == options.lane_local_title;
 			});
 			if (found == jobs.end()) {
 				auto job              = std::make_shared<TableJob>();
@@ -2274,6 +2282,7 @@ struct PipelineCache::ProgramCache {
 				                                ShaderRecompiler::IR::ResourceSpecialization {table_specialization},
 				                                job->module);
 				permutation.table_mode = true;
+				permutation.lane_title = job->options.lane_local_title;
 			} else {
 				static std::atomic<uint32_t> reports {0};
 				if (reports.fetch_add(1, std::memory_order_relaxed) < 200)
@@ -2307,7 +2316,9 @@ struct PipelineCache::ProgramCache {
 		const auto source_begin = PipelineSourceLog() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		bool       translated_here = false;
 		double     translate_ms    = 0.0;
-		const auto adopt = [&] { return AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor); };
+		const auto adopt = [&] {
+			return title_on ? nullptr : AdoptPrefetchedModule(entry->second, options, specialization, push_data_cursor);
+		};
 		if (entry == programs.end() ||
 		    (adopt() == nullptr && (!TakePrefetchedModules(entry->second, params) || adopt() == nullptr))) {
 			translated_here = true;
@@ -2349,6 +2360,7 @@ struct PipelineCache::ProgramCache {
 				entry->second.permutations.push_back(CompilePermutation(
 				    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 			}
+			entry->second.permutations.back().lane_title = options.lane_local_title;
 			render_translations++;
 			render_translate_ms +=
 			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();

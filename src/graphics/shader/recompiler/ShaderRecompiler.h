@@ -12,6 +12,15 @@
 
 namespace Libs::Graphics::ShaderRecompiler {
 
+// KYTY_LANE_LOCAL_TITLE: the title list (four Demon's Souls lighting and fog programs lane-local by hash, Translate.cpp)
+// for every translation (1), or per permutation as kyty_local_lane_local_title is when it is made ("live": a
+// same-process A/B, each side's permutations kept apart, those of the side switched to translated when first met), or
+// off (anything else).
+bool LaneLocalTitleDefault();
+bool LaneLocalTitleLive();
+bool LaneLocalTitleLiveOn();
+bool LaneLocalTitleProgram(uint64_t hash);
+
 struct CompileOptions {
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
@@ -23,6 +32,7 @@ struct CompileOptions {
 	bool                        enable_lod_stats           = false;
 	bool                        table_mode                 = false; // IR::EnterTableMode
 	bool                        exec_demand                = IR::ExecDemandEnabled(); // IR::EliminateMaskedSelects
+	bool                        lane_local_title           = LaneLocalTitleDefault(); // the title list (see above)
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
