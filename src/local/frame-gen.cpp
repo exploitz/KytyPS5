@@ -5,6 +5,7 @@
 #include "local-platform.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "loader/demonsSoulsHdOutput.h"
 
 #include <algorithm>
 #include <atomic>
@@ -621,9 +622,14 @@ bool FsrEnsureFrameGeneration(vk::Extent2D render) {
 	return true;
 }
 
-// The game's interface canvas (NoteUiCanvas: its guest address; the GPU thread's).
+// The game's interface canvas (NoteUiCanvas: its guest address; the GPU thread's): 3840x2160, or the HD output's
+// 1920x1080 (loader/demonsSoulsHdOutput.h).
 std::atomic<uint64_t> g_ui_canvas {0};
-constexpr uint32_t    UiCanvasWidth = 3840, UiCanvasHeight = 2160;
+
+vk::Extent2D UiCanvasExtent() {
+	namespace Hd = ::Loader::DemonsSoulsHdOutput;
+	return Hd::Active() ? vk::Extent2D {Hd::HdWidth, Hd::HdHeight} : vk::Extent2D {3840, 2160};
+}
 
 // FSR's HUD-less images (RecordHudless): the backbuffer with the HUD painted over by the scene around it, two in turn
 // (the interpolation of one may still read it while the next frame's is made).
@@ -1913,13 +1919,15 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	if (const uint64_t canvas = g_ui_canvas.load(std::memory_order_relaxed); g_fsr && canvas != 0) {
 		static uint32_t reports = 0;
 		if (const auto id = cache.FindImageFromRange(canvas, 8, false); id) {
-			auto& ui = cache.GetImage(id);
-			if (ui.backing.image != nullptr && ui.backing.extent.width == UiCanvasWidth &&
-			    ui.backing.extent.height == UiCanvasHeight && !IsDepthFormat(ui.backing.format)) {
-				// (At half its size: its alpha is a mask, read a few pixels wide; a quarter of the video memory.)
+			auto&              ui   = cache.GetImage(id);
+			const vk::Extent2D size = UiCanvasExtent();
+			if (ui.backing.image != nullptr && ui.backing.extent.width == size.width &&
+			    ui.backing.extent.height == size.height && !IsDepthFormat(ui.backing.format)) {
+				// (At most 1920x1080, the 4K canvas at half its size: its alpha is a mask, read a few pixels wide; a
+				// quarter of the video memory.)
 				bool failed = false;
 				Configure(graphics, inputs.ui, inputs.ui_view, ui.backing, nullptr,
-				          vk::Extent2D {UiCanvasWidth / 2, UiCanvasHeight / 2}, &failed);
+				          vk::Extent2D {std::min(size.width, 1920u), std::min(size.height, 1080u)}, &failed);
 				if (!failed) {
 					BlitInto(vk_command, ui, inputs.ui);
 					inputs.ui_valid = true;

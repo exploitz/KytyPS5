@@ -94,29 +94,17 @@ bool GraphicContext::CreateAllocator() {
 			info.preferredLargeHeapBlockSize = uint64_t {64} << 20u;
 		}
 	}
-	// KYTY_VRAM_LIMIT_MB=<n>: video memory as on a GPU with n MiB (VMA's heap size limit): its budget,
-	// and allocations past it failing, for tests of memory pressure on smaller GPUs.
-	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_limits {};
-	if (const char* text = std::getenv("KYTY_VRAM_LIMIT_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0) {
-		heap_limits.fill(VK_WHOLE_SIZE);
-		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
-			if (physical_device_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
-				heap_limits[heap] = std::strtoull(text, nullptr, 10) << 20u;
-			}
-		}
-		info.pHeapSizeLimit = heap_limits.data();
-	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
-	// KYTY_SIMULATE_VRAM_MB=<n>: a GPU with n MiB of video memory, for tests on a bigger one. Unlike
-	// KYTY_VRAM_LIMIT_MB (an allocator limit: what it puts in system memory types the driver still places in video
-	// memory while there is room), the rest of the largest device-local heap is taken here at the highest priority
-	// and kept, so the driver and OS move the game's memory to system memory as on such a GPU. Budget and usage
-	// (GetTotalMemoryBudget, GetDeviceMemoryUsage) leave it out.
+	// KYTY_SIMULATE_VRAM_MB=<n>: a GPU with n MiB of video memory, for tests on a bigger one. Unlike an allocator limit
+	// (what VMA puts in system memory types the driver still places in video memory while there is room), the rest of
+	// the largest device-local heap is taken here at the highest priority and kept, so the driver and OS move the game's
+	// memory to system memory as on such a GPU. Budget and usage (GetTotalMemoryBudget, GetDeviceMemoryUsage) leave it
+	// out.
 	if (const char* simulate = std::getenv("KYTY_SIMULATE_VRAM_MB"); simulate != nullptr) {
 		const uint64_t simulated = std::strtoull(simulate, nullptr, 10) << 20u;
 		uint32_t       heap      = 0;
@@ -352,7 +340,7 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 // and its memory for identical creation parameters is equivalent to a fresh
 // allocation.
 extern "C" {
-volatile std::atomic<uint32_t> kyty_local_image_pool_mode {0};
+volatile std::atomic<uint32_t> kyty_local_image_pool_mode {1};
 }
 namespace {
 struct PooledImage {

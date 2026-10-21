@@ -44,15 +44,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
                              const TranslateOptions& options);
 
 // A wave64 program whose results in each lane depend on no lane outside its 32-lane half (LaneLocal.cpp): on a host
-// with 32-wide subgroups it runs one GCN lane per invocation. `reason`: why not; `uniform_loads`: whether it took a buffer
-// load at one address for a value the same in every lane (KYTY_LANE_LOCAL_UNIFORM_LOADS).
-bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = nullptr, bool* uniform_loads = nullptr);
+// with 32-wide subgroups it runs one GCN lane per invocation. `reason`: why not.
+bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = nullptr);
 
-// What makes a wave64 program lane-local (LaneLocal.cpp): taken buffer loads at one address (uniform_loads), or, for a
-// 64-thread group whose two halves cooperate (`cooperative`), the lane reads the wave runs through workgroup memory and
-// the lane-mask branches the wave decides (by pc).
+// What makes a wave64 program lane-local (LaneLocal.cpp), for a 64-thread group whose two halves cooperate
+// (`cooperative`): the lane reads the wave runs through workgroup memory and the lane-mask branches the wave decides
+// (by pc).
 struct LaneLocalProof {
-	bool                  uniform_loads = false;
 	std::vector<uint32_t> exchange_reads;
 	std::vector<uint32_t> wave_branches;
 	[[nodiscard]] bool    Cooperative() const { return !exchange_reads.empty() || !wave_branches.empty(); }

@@ -11,6 +11,8 @@ void               HostInputInit();
 // Every presented frame (the window title's counter): the scripted input watches the frame rate.
 void               HostInputNotePresentedFrame();
 void               HostInputKey(int key_code, bool down);
+// The keymap (--keymap) gives that key to a control of the pad.
+[[nodiscard]] bool HostInputMapsKey(int key_code);
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
 void               HostInputToggleMouseToJoystick();
 // The wheel's notches (SDL's y: up positive) as D-pad presses without a custom key map.

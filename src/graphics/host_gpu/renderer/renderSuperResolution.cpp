@@ -18,7 +18,6 @@
 #include "common/assert.h"
 #include "frame-gen.h"
 #include "gpu_tiler_shaders/sr_exposure_spv.h"
-#include "speculation-state.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -304,8 +303,6 @@ void ReplayUpscale(std::span<const LocalVulkanRecording::Segment> segments, cons
 
 void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolution::Packet& packet) {
 	EXIT_IF(buffer.IsInvalid());
-	// (A hole of a speculative translation: the commit, on the GPU thread, runs it - as DispatchDirect.)
-	if (Spec::Current() != nullptr) return Report("a speculative translation reached a dispatch: skipped");
 	m_context.GetCommandScheduler().PopPendingOperations();
 	RenderLockGuard lock(m_context.GetMutex());
 	FrameGen::NoteScene(); // (the game's 3D view, as its TAA pass notes it)

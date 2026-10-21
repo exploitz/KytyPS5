@@ -34,9 +34,6 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	// VK_EXT_memory_priority, enabled only for KYTY_SIMULATE_VRAM_MB (vma.cpp).
 	bool                               memory_priority_enabled               = false;
-	// VK_KHR_pipeline_executable_properties, enabled only for KYTY_PIPELINE_STATS=1 (shaders.cpp: a survey).
-	bool                               pipeline_statistics_enabled           = false;
-	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// A pipeline may require 64-lane subgroups of its pixel shader (KYTY_PS_WAVE64).
 	bool                               fragment_wave64_requirable            = false;
@@ -186,9 +183,6 @@ struct GraphicContext {
 	// The game buffers' own VMA pool (BufferCache), whose blocks BufferCache::Defragment compacts. KYTY_BUFFER_DEFRAG:
 	// on with a small video memory, 0 off, 1 on any GPU. Null: off, game buffers in VMA's default pools.
 	VmaPool                       game_buffer_pool = nullptr;
-	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
-	// (MemoryUsage::SparseDeviceLocal).
-	bool                          sparse_residency_buffers = false;
 	// An image only sampled and copied (CreateImage places these apart on such a GPU).
 	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
 		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |
@@ -196,10 +190,6 @@ struct GraphicContext {
 	}
 	std::vector<vk::DeviceMemory> simulation_ballast;
 	uint64_t                      simulation_ballast_bytes = 0;
-	void                   AppendHardwareRayTracingDeviceExtensions(
-	    const std::vector<vk::ExtensionProperties>& available_extensions,
-	    std::vector<const char*>&                   device_extensions);
-	void LoadHardwareRayTracingFunctions() const;
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;

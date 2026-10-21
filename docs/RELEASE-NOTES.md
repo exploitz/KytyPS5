@@ -1,7 +1,49 @@
 ## New in this build
 
-v20261020b fixes a crash of v20261020 on PCs with 16 GB of RAM. Everything new in v20261020 (further below) is in it
-too.
+The shaders are the same as in v20261020b: your precompiled store stays valid. Running the precompile again adds the
+new boss-death shaders below (only the new part is compiled).
+
+- **A 1080p output (optional, new):** on a 1080p screen, Demon's Souls can now run its own HD mode: its
+  post-processing and HUD at 1920x1080 instead of 3840x2160 scaled down afterwards. Less work for the graphics card:
+  at the 1-1 bench spot on an RTX 5090, 69.8 -> 78.3 fps. Turn it on with `run.cmd -Set KYTY_HD_OUTPUT=1` (not
+  together with DLSS: `-Upscaler dlss` makes the 4K output). Known issue: in this mode the souls counter's dark strip
+  shows as a small black square; the launcher gets a setting for it once that is fixed. (A contribution by @intellq,
+  PR #103.)
+- **AMD FSR 3.1 frame generation (2x)** for graphics cards without DLSS frame generation: the launcher's "AMD FSR 3
+  frame generation" or `run.cmd -Fsr`, with AMD's signed `amd_fidelityfx_vk.dll` (from AMD's FidelityFX SDK) next to
+  the emulator. (Contributions by @iSamigor, PRs #96 and #99.)
+- **Add-on content (DLC):** add-ons go in `Content\PPSA01341\`, one folder each, checked by their content id.
+  Add-ons without files of their own, such as a deluxe edition's extras, can be declared in `dlc_emu.ini`. The
+  README's "Add-on content (DLC)" explains both. (A contribution by @Myoko, PR #104.)
+- **Your own keys:** `--keymap` lines in `launch.json` now take key names as people write them (`LeftShift`,
+  `LeftCtrl`, `Spacebar`, `Esc`). Space and Esc can be mapped; when Space is mapped, the Pause key pauses. A line the
+  emulator cannot use is skipped and named in the run log instead of stopping the start. See the README's "Your own
+  keys" (issue #91).
+- **Ultrawide:** with `-Aspect 21:9` or `32:9`, adding `-AspectFit` keeps the movies (and the title and loading
+  screens) at 16:9 with black bars at the sides. Without it they fill the screen as before (issue #97).
+- **Game on a hard disk:** the README now says what took a player from freezes to full speed: the game packed into a
+  `.zar` on the hard disk and the emulator folder on an SSD (issue #91).
+- **Fixes:**
+  - AMD Radeon RX 9000/7000/6000: the emulator could end after a few minutes of play with "TextureCache: invalid
+    image view description" (issue #102).
+  - "TextureCache: color target requires rediscovery before final acquisition" could end the emulator on fast travel
+    from the Nexus to Boletaria (issue #94).
+  - DLSS super resolution showed a black 3D image on game version 01.005.000 (thanks to @Al3cko for the analysis), and
+    with the NVIDIA app's DLSS override, where the game's own upscale is now used instead (issue #87).
+  - A button press could be lost during a stutter (a contribution by @Vorshim92, PR #100).
+  - A boss death could freeze the game for up to 51 s the first time: its compute shaders are now precompiled in all
+    the forms the game uses them (PR #96).
+  - An update precompile no longer makes every stored pipeline again just to copy it: updates are much faster
+    (issue #85).
+- **Linux:** DLSS super resolution, DLAA and DLSS frame generation through NVIDIA NGX (a contribution by @Tutuzaooo,
+  PR #101).
+- **Internal cleanup:** about 6,000 lines of finished experiments and diagnostics are gone, and the release settings
+  are now the emulator's own defaults (`launch.json` no longer lists them; `-Set KEY=` still turns one off). Same
+  behaviour and frame rates (checked on all 16 maps), same shaders.
+- **Thanks** to @intellq, @Myoko, @iSamigor, @Vorshim92, @Tutuzaooo and @Al3cko for their contributions, and to
+  everyone who reported problems and tested.
+
+## New in v20261020b
 
 - **Crash on PCs with 16 GB of RAM (issue #91):** v20261020's new memory saving for textures (on by default with 20 GB
   of RAM or less) could end the emulator with "PageManager fatal: read-watcher overflow" while a level loaded. Fixed;
@@ -11,74 +53,38 @@ too.
   now, and the precompile builds them.
 - **More shaders precompiled:** automated tours through all six worlds, fighting and killing every enemy (bosses too),
   added 153 shader programs and 580 pipelines to the hints. Among them are three large Shrine of Storms shaders that
-  froze the game for up to 40 s the first time they were needed. The launcher offers the precompile again at the first
-  start; only the new part is compiled.
-- **Linux with AMD graphics:** the emulator's main thread asked the graphics driver about 2,000 times a frame how far
-  the GPU had got. On Linux each question is a system call (about 9 µs on RADV). Questions whose answer is already known
-  are skipped now, and where a question is slow, a separate thread follows the GPU instead (`KYTY_TIMELINE_WATCHER=0`
-  turns it off). Not measured on Linux yet: reports are welcome in issue #80.
-- **Thanks** to @ededaelita1-afk for the crash report and to @yazuc for the Linux profiles.
+  froze the game for up to 40 s the first time they were needed.
+- **Linux with AMD graphics:** questions to the graphics driver whose answer is already known are skipped, and where a
+  question is slow, a separate thread follows the GPU instead (`KYTY_TIMELINE_WATCHER=0` turns it off; issue #80).
 
-## New in v20261020
-
-- **Less memory on 16 GB PCs and 8 GB graphics cards:**
-  - Game memory nothing ever wrote is no longer read when the GPU first uses it, only taken as zeros: 0.7-1.4 GB less
-    RAM in use on a 16 GB PC (`KYTY_FRESH_MEMORY=0` turns it off).
-  - On PCs with 16 GB of RAM, textures the game only reads keep one copy, in video memory, instead of a second one in
-    RAM: about 0.5 GB less RAM in use (`KYTY_TEXTURE_OFFLOAD=0` turns it off, `=1` turns it on with more RAM).
-  - The shaders of a world the game left are dropped a minute after it, on every graphics card. Before, they piled up
-    for the whole session (the driver's memory went from 0.9 to 2 GB on a trip through five worlds).
-  - The warm-up at start compiles the shaders recorded for the map the game loads, not those of every map (up to 4 GB
-    of the driver's memory).
-  - Video memory: the GPU's address table takes 64 MiB instead of 512 MiB, and game buffers no longer keep video
-    memory for game memory the game freed. On cards with less than 12 GB, video memory is also allocated in smaller
-    blocks and game buffers are compacted after the game frees memory: about 0.6 GB less video memory on an 8 GB card
-    after travelling between worlds (`KYTY_BUFFER_DEFRAG=0` turns the compacting off).
-- **AMD and Intel graphics cards:** pipelines compiled while playing are kept and loaded at the next start, instead of
-  being compiled again every session (issue #78; `KYTY_PLAYED_PIPELINES=0` turns it off).
-- **More shaders precompiled:** a player shared the shader hints of a whole 1.07 playthrough (issue #88, thanks
-  @tscftw): 2,091 more shader programs and 2,213 more pipelines, from places our own test runs never reached. The
-  launcher offers the precompile again at the first start; only the new part is compiled.
-- **Smoother:** in places with many lights and enemies (Boletaria 1-3), reading a light table no longer waits for the
-  GPU: a few more fps and fewer short stutters.
-- **Fixes:**
-  - On "lite" Windows builds that turn Control Flow Guard on for every program, the emulator ended within the first
-    seconds without a line in the log (issue #56).
-  - The save dialogs show Chinese, Japanese and Korean text with the system's font instead of "?" (a contribution by
-    @Myoko, PR #75).
-  - A save whose capacity record was all zeros (after a power cut) failed every time the game opened it; it now counts
-    as empty (a contribution by @Vorshim92, PR #74).
-  - The driver's shader caches: a small one is saved at least once a minute while shaders compile, and with the
-    precompiled store one past 256 MiB starts over instead of growing.
-- **README:** how to play in Chinese, Japanese or Korean (a value in the game's `param.json` picks the language list),
-  and how to update to a newer package (extract it over the old folder; what is kept).
-- **Thanks** to @nerdjb for the Linux port fixes and the Linux package, and to everyone who sent logs and tests.
+Earlier changes are on the release pages of v20261020 and before.
 
 ## 本版本的变化
 
-v20261020b 修正了 v20261020 在 16 GB 内存电脑上的一个崩溃。v20261020 的所有新内容（见下方）也都包含在内。
+着色器与 v20261020b 相同：你已经预编译的存储继续有效。再运行一次预编译会加入下面提到的 Boss 死亡着色器（只编译新增的部分）。
+
+- **1080p 输出（可选，新增）：** 在 1080p 显示器上，恶魔之魂现在可以使用它自己的高清模式：后期处理和 HUD 直接以 1920x1080 渲染，不再先渲染 3840x2160 再缩小。显卡负担更小：RTX 5090 在 1-1 测试点从 69.8 提升到 78.3 fps。用 `run.cmd -Set KYTY_HD_OUTPUT=1` 开启（不能与 DLSS 同时使用：`-Upscaler dlss` 输出的是 4K）。已知问题：这个模式下魂数旁边的深色条会显示成一个小黑方块；修好之后启动器会加上这个选项。（@intellq 的贡献，PR #103。）
+- **AMD FSR 3.1 帧生成（2 倍）**，适用于不支持 DLSS 帧生成的显卡：在启动器里勾选 "AMD FSR 3 frame generation"，或用 `run.cmd -Fsr`，需要把 AMD 签名的 `amd_fidelityfx_vk.dll`（来自 AMD 的 FidelityFX SDK）放在模拟器旁边。（@iSamigor 的贡献，PR #96 和 #99。）
+- **附加内容（DLC）：** 附加内容放在 `Content\PPSA01341\`，每个一个文件夹，按内容 ID 校验。没有自己文件的附加内容（例如豪华版的额外内容）可以写在 `dlc_emu.ini` 里声明。README 的 "Add-on content (DLC)" 一节说明了两种方式。（@Myoko 的贡献，PR #104。）
+- **自定义按键：** `launch.json` 里的 `--keymap` 现在可以识别常见的按键写法（`LeftShift`、`LeftCtrl`、`Spacebar`、`Esc`）。空格和 Esc 可以映射了；空格被映射后，用 Pause 键暂停。模拟器无法使用的行会被跳过，并在运行日志里写明，不会再导致无法启动。详见 README 的 "Your own keys"（issue #91）。
+- **超宽屏：** 使用 `-Aspect 21:9` 或 `32:9` 时，再加上 `-AspectFit`，过场动画（以及标题画面和加载画面）会保持 16:9，两侧显示黑边；不加时仍和以前一样铺满屏幕（issue #97）。
+- **游戏放在机械硬盘上：** README 里写了一位玩家从卡顿变成全速运行的方法：在机械硬盘上把游戏打包成 `.zar`，模拟器文件夹放在 SSD 上（issue #91）。
+- **修正：**
+  - AMD Radeon RX 9000/7000/6000：游玩几分钟后模拟器可能以 "TextureCache: invalid image view description" 退出（issue #102）。
+  - 从连接之地（Nexus）传送到波雷塔利亚时，模拟器可能以 "TextureCache: color target requires rediscovery before final acquisition" 退出（issue #94）。
+  - DLSS 超分辨率在游戏版本 01.005.000 上 3D 画面是黑的（感谢 @Al3cko 的分析）；使用 NVIDIA App 的 DLSS 覆盖设置时也会黑屏，现在会改用游戏自带的放大（issue #87）。
+  - 卡顿时按键可能丢失（@Vorshim92 的贡献，PR #100）。
+  - Boss 死亡时第一次可能让游戏卡住最长 51 秒：它的计算着色器现在会按游戏用到的所有形式预编译（PR #96）。
+  - 更新时的预编译不再为了复制而把存储里的每个管线重新创建一遍：更新快了很多（issue #85）。
+- **Linux：** 通过 NVIDIA NGX 支持 DLSS 超分辨率、DLAA 和 DLSS 帧生成（@Tutuzaooo 的贡献，PR #101）。
+- **内部清理：** 删掉了约 6,000 行已经结束的实验和诊断代码；发布用的设置现在就是模拟器自己的默认值（`launch.json` 不再列出它们；`-Set KEY=` 仍然可以关闭某一项）。行为和帧率不变（16 张地图全部测试过），着色器不变。
+- **感谢** @intellq、@Myoko、@iSamigor、@Vorshim92、@Tutuzaooo 和 @Al3cko 的贡献，也感谢所有报告问题和帮忙测试的玩家。
+
+## v20261020b 的变化
 
 - **16 GB 内存电脑上的崩溃（issue #91）：** v20261020 新增的纹理省内存功能（内存 20 GB 及以下默认开启）可能在加载关卡时让模拟器以 "PageManager fatal: read-watcher overflow" 退出。已修正，该功能保持开启。如果你为了绕过崩溃加了 `-Set KYTY_TEXTURE_OFFLOAD=0`，现在可以去掉了。
-- **会让模拟器退出的四个着色器：** 游戏里有四个像素着色器无法翻译，游戏用到它们的地方模拟器就会停止（自动测试在污秽谷（Valley of Defilement）遇到了其中一个）。现在它们可以正常翻译，预编译也会生成它们。
-- **预编译的着色器更多了：** 自动测试跑遍了全部六个世界，与每个敌人（包括 Boss）战斗并击杀，提示里多了 153 个着色器程序和 580 个管线。其中包括风暴神殿（Shrine of Storms）的三个大型着色器，它们第一次用到时会让游戏卡住最长约 40 秒。第一次启动时启动器会再次提示预编译，只会编译新增的部分。
-- **Linux 和 AMD 显卡：** 模拟器主线程每帧向显卡驱动询问 GPU 进度约 2,000 次。在 Linux 上每次询问都是一次系统调用（RADV 上约 9 微秒）。现在已知答案的询问会被跳过；询问较慢时，改由一个单独的线程跟踪 GPU 进度（`KYTY_TIMELINE_WATCHER=0` 可关闭）。尚未在 Linux 上实测，欢迎在 issue #80 反馈。
-- **感谢** @ededaelita1-afk 报告崩溃，感谢 @yazuc 提供 Linux 性能分析数据。
+- **会让模拟器退出的四个着色器：** 游戏里有四个像素着色器无法翻译，游戏用到它们的地方模拟器就会停止。现在它们可以正常翻译，预编译也会生成它们。
+- **预编译的着色器更多了：** 自动测试跑遍了全部六个世界，与每个敌人（包括 Boss）战斗并击杀，提示里多了 153 个着色器程序和 580 个管线，其中包括风暴神殿的三个大型着色器，它们第一次用到时会让游戏卡住最长约 40 秒。
+- **Linux 和 AMD 显卡：** 已知答案的驱动询问会被跳过；询问较慢时，改由一个单独的线程跟踪 GPU 进度（`KYTY_TIMELINE_WATCHER=0` 可关闭；issue #80）。
 
-## v20261020 的变化
-
-- **16 GB 内存的电脑和 8 GB 显卡占用更少：**
-  - 游戏从未写过的内存，在 GPU 第一次使用时不再去读取，直接当作全零：16 GB 内存的电脑上少用 0.7-1.4 GB 内存（`KYTY_FRESH_MEMORY=0` 可关闭）。
-  - 在 16 GB 内存的电脑上，游戏只读取的纹理只在显存里保留一份，不再在内存里多存一份：少用约 0.5 GB 内存（`KYTY_TEXTURE_OFFLOAD=0` 可关闭，`=1` 可在更大内存上开启）。
-  - 游戏离开一个世界一分钟后，那个世界的着色器会被释放，所有显卡都是如此。之前它们会在整个游玩过程中一直累积（走一遍五个世界，驱动内存从 0.9 GB 涨到 2 GB）。
-  - 启动时的预热只编译游戏正在加载的地图录到的着色器，不再编译所有地图的（之前最多占用驱动 4 GB 内存）。
-  - 显存：GPU 地址表只占 64 MiB，不再是 512 MiB；游戏缓冲区不再为游戏已释放的内存保留显存。显存小于 12 GB 的显卡上，显存还会按更小的块分配，游戏释放内存后缓冲区会被整理紧凑：8 GB 显卡在几个世界之间来回之后显存少用约 0.6 GB（`KYTY_BUFFER_DEFRAG=0` 可关闭整理）。
-- **AMD 和 Intel 显卡：** 游戏过程中编译的管线会被保存，下次启动直接载入，不再每次都重新编译（issue #78；`KYTY_PLAYED_PIPELINES=0` 可关闭）。
-- **预编译的着色器更多了：** 一位玩家分享了他完整通关 1.07 版的着色器提示（issue #88，感谢 @tscftw）：多了 2,091 个着色器程序和 2,213 个管线，来自我们自己的测试路线没有走到的地方。第一次启动时启动器会再次提示预编译，只会编译新增的部分。
-- **更流畅：** 在灯光和敌人很多的地方（波雷塔利亚 1-3），读取灯光表不再等待 GPU：帧率高几帧，短暂卡顿更少。
-- **修正：**
-  - 在对所有程序都开启控制流防护（CFG）的"精简版" Windows 上，模拟器会在开头几秒内退出，日志里没有任何记录（issue #56）。
-  - 存档对话框里的中文、日文、韩文改用系统字体显示，不再显示为"?"（@Myoko 的贡献，PR #75）。
-  - 容量记录全为零的存档（断电之后）以前每次打开都会失败，现在按空存档处理（@Vorshim92 的贡献，PR #74）。
-  - 驱动的着色器缓存：编译着色器期间，较小的缓存至少每分钟保存一次；有预编译存储时，超过 256 MiB 的缓存会重新开始，不再一直增长。
-- **README：** 如何用中文、日文或韩文游玩（游戏 `param.json` 里的一个值决定可选语言），以及如何更新到新的包（解压覆盖旧文件夹，哪些内容会保留）。
-- **感谢** @nerdjb 完成 Linux 移植的修正和 Linux 安装包，也感谢所有提供日志和测试的玩家。
+更早的变化见 v20261020 及之前版本的发布页面。

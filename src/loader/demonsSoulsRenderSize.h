@@ -11,8 +11,9 @@ struct Program;
 // renders its 3D at that height (16:9) instead. The output, the UI and what the game draws at output size stay 4K;
 // GPU-bound PCs (a laptop's RTX 3080: 1-1 standing 20.7 -> 24.5 fps at 1080) trade sharpness for frame rate, and 2160
 // renders the 3D at the output's own 3840x2160 (an RTX 5090 at 1-1 standing: 68 -> 55 fps, GPU-bound).
-// Unset or 1440: the game as it is. The game's own 1080p output modes (r_Wants4K 1 and 2) are no option: their UI
-// keeps the 4K layout (off screen). With the game's super resolution path on (KYTY_UPSCALER,
+// Unset or 1440: the game as it is. The game's own 1080p output modes (r_Wants4K 1 and 2) taken alone keep their UI in
+// the 4K layout (off screen); KYTY_HD_OUTPUT (loader/demonsSoulsHdOutput.h) runs them whole, the height then sizing
+// their 3D (at most 1080; the aspect as here, squeezed into the 1920x1080 output). With the game's super resolution path on (KYTY_UPSCALER,
 // loader/demonsSoulsSuperResolution.h) the performance mode is display mode 5: the height sizes its 3D instead
 // (unset: the PS5 Pro's 2688x1512; at least 1080), the upscaler making the 3840x2160 image from it.
 // KYTY_RENDER_ASPECT=<w>:<h> (run-windows.ps1 -Aspect, the launcher's "Aspect ratio"; 21:9 is taken as 64:27): the 3D
@@ -66,6 +67,9 @@ inline constexpr uint32_t         OutputWidths[5] {1920, 1920, 3840, 3840, 3840}
 inline constexpr uint32_t ModeWidths[5] {1600, 1920, 2560, 3840, 2688};
 inline constexpr uint32_t ModeHeights[5] {900, 1080, 1440, 2160, 1512};
 inline constexpr int      PerformanceMode = 2, TrinityMode = 4; // (indexes in the tables)
+// The HD output's display mode with another render size than its 1920x1080 (loader/demonsSoulsHdOutput.h): mode 1,
+// whose case loads its 3D size (1600x900) after the 1920x1080 output, as mode 3's after the 4K one.
+inline constexpr int HdUpscaledMode = 0;
 // The render setup's constructor storing the projection's aspect, 16/9 as a float: mov dword [rbx+4], 0x3fe38e39
 // (01.007.000 0x90090ae7f, 01.005.000 0x9008ef287; the only such store either build has).
 inline constexpr std::string_view AspectStore = "c7 43 04 39 8e e3 3f";

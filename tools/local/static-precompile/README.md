@@ -70,7 +70,7 @@ shader / pipeline in the game no longer stalls for 1–3 seconds.
 
    Recording tours (`demons-souls-save.py set-map` spawn points, every world) make the recordings.
 
-## Portable specialization (recompiler, `KYTY_PORTABLE_SHADERS`, on by default)
+## Portable specialization (recompiler)
 
 Information that is not in the shader binary but only in runtime descriptors used to be baked into the
 SPIR-V, which a static pass cannot predict:

@@ -23,6 +23,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/shader/shader.h"
+#include "loader/demonsSoulsHdOutput.h"
 #include "loader/demonsSoulsRenderSize.h"
 
 #include "draw-state-observer.h"
@@ -42,7 +43,14 @@ namespace Libs::Graphics::HudAnchor {
 // user data's first four words, or (PixelShader) as canvas pixels in the first V# of a table two pointers away.
 constexpr std::array<uint64_t, 2> ClipShaders {0x7e880a66bf1b69c6ULL, 0xb2f062027869d4eeULL};
 constexpr uint64_t                PixelShader = 0xbd39a2eba2d20d8bULL;
-constexpr uint32_t                CanvasWidth = 3840, CanvasHeight = 2160;
+// The interface canvas: 3840x2160, or the HD output's 1920x1080 (its own layout, the same areas in clip coordinates and
+// the same shaders; the pixel shader's scale constants then 1/1920, 1/1080).
+inline uint32_t CanvasWidth() {
+	return ::Loader::DemonsSoulsHdOutput::Active() ? ::Loader::DemonsSoulsHdOutput::HdWidth : 3840u;
+}
+inline uint32_t CanvasHeight() {
+	return ::Loader::DemonsSoulsHdOutput::Active() ? ::Loader::DemonsSoulsHdOutput::HdHeight : 2160u;
+}
 constexpr uint32_t                MaxVertices = 8192;
 
 // The HUD's areas in clip coordinates (y up; frames of elements reach a little past the canvas's edges) and the side
@@ -104,8 +112,8 @@ inline uint32_t WideWidth() {
 inline uint32_t CanvasWidthOf(const HW::Context& ctx) {
 	const auto& target = ctx.GetRenderTarget(0);
 	const auto  width  = target.attrib2.width + 1u;
-	if (target.base.addr == 0 || target.attrib2.height + 1u != CanvasHeight) return 0;
-	return width == CanvasWidth || (WideWidth() != 0 && width == WideWidth()) ? width : 0;
+	if (target.base.addr == 0 || target.attrib2.height + 1u != CanvasHeight()) return 0;
+	return width == CanvasWidth() || (WideWidth() != 0 && width == WideWidth()) ? width : 0;
 }
 
 inline uint64_t HashAt(uint64_t address) {
@@ -225,7 +233,8 @@ inline bool IsReticle(const HW::VertexShaderInfo& vs, uint32_t first) {
 // (FrameGen::NoteUiCanvas).
 inline void NoteCanvas(const HW::Context& ctx, const HW::VertexShaderInfo& vs) {
 	const auto& target = ctx.GetRenderTarget(0);
-	if (target.base.addr == 0 || target.attrib2.width + 1u != CanvasWidth || target.attrib2.height + 1u != CanvasHeight)
+	if (target.base.addr == 0 || target.attrib2.width + 1u != CanvasWidth() ||
+	    target.attrib2.height + 1u != CanvasHeight())
 		return;
 	const uint64_t hash = HashAt(vs.es_regs.data_addr);
 	if (hash == PixelShader || std::find(ClipShaders.begin(), ClipShaders.end(), hash) != ClipShaders.end())
@@ -245,7 +254,7 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 	const bool     clip  = std::find(ClipShaders.begin(), ClipShaders.end(), hash) != ClipShaders.end();
 	if (!clip && hash != PixelShader) return 0;
 	// (An interface shader's target: the canvas the wide output's other draws into it are widened in, StretchScope.)
-	if (width != CanvasWidth) state.canvas = target.base.addr;
+	if (width != CanvasWidth()) state.canvas = target.base.addr;
 	if (!FrameGen::SceneNoted()) return 0;
 	const auto& viewport = ctx.GetScreenViewport().viewports[0];
 	const auto& user   = vs.gs_user_sgpr;
@@ -287,7 +296,7 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 			xy[1] = 1.0f - 2.0f * xy[1] * scale[1];
 		}
 		// (The wide canvas: the window x the viewport puts it at, in the 3840 wide layout's clip coordinates.)
-		if (width != CanvasWidth) xy[0] = 2.0f * (viewport.xoffset + xy[0] * viewport.xscale) / CanvasWidth - 1.0f;
+		if (width != CanvasWidth()) xy[0] = 2.0f * (viewport.xoffset + xy[0] * viewport.xscale) / CanvasWidth() - 1.0f;
 		icon  = icon && xy[0] >= Icon.x0 && xy[0] <= Icon.x1 && xy[1] >= Icon.y0 && xy[1] <= Icon.y1;
 		min_x = std::min(min_x, xy[0]);
 		max_x = std::max(max_x, xy[0]);
@@ -349,20 +358,20 @@ struct Rect {
 };
 inline uint32_t Complement(const HW::Context& ctx, std::array<Rect, 32>& out) {
 	const auto&                    viewport = ctx.GetScreenViewport().viewports[0];
-	const bool                     wide     = CanvasWidthOf(ctx) > CanvasWidth;
-	const auto window_x = [&](float x) { return wide ? (x + 1.0f) * (CanvasWidth / 2.0f) : viewport.xoffset + x * viewport.xscale; };
+	const bool                     wide     = CanvasWidthOf(ctx) > CanvasWidth();
+	const auto window_x = [&](float x) { return wide ? (x + 1.0f) * (CanvasWidth() / 2.0f) : viewport.xoffset + x * viewport.xscale; };
 	std::array<Rect, Areas.size()> held {};
-	std::array<int, 2 * Areas.size() + 2> ys {0, static_cast<int>(CanvasHeight)};
+	std::array<int, 2 * Areas.size() + 2> ys {0, static_cast<int>(CanvasHeight())};
 	uint32_t                       ny = 2;
 	for (uint32_t a = 0; a < Areas.size(); ++a) {
 		const auto& area = Areas[a];
 		const float x0 = window_x(area.x0), x1 = window_x(area.x1);
 		const float y0 = viewport.yoffset + area.y0 * viewport.yscale, y1 = viewport.yoffset + area.y1 * viewport.yscale;
 		auto&       r  = held[a];
-		r.left   = std::clamp(static_cast<int>(std::floor(std::min(x0, x1))), 0, static_cast<int>(CanvasWidth));
-		r.right  = std::clamp(static_cast<int>(std::ceil(std::max(x0, x1))), 0, static_cast<int>(CanvasWidth));
-		r.top    = std::clamp(static_cast<int>(std::floor(std::min(y0, y1))), 0, static_cast<int>(CanvasHeight));
-		r.bottom = std::clamp(static_cast<int>(std::ceil(std::max(y0, y1))), 0, static_cast<int>(CanvasHeight));
+		r.left   = std::clamp(static_cast<int>(std::floor(std::min(x0, x1))), 0, static_cast<int>(CanvasWidth()));
+		r.right  = std::clamp(static_cast<int>(std::ceil(std::max(x0, x1))), 0, static_cast<int>(CanvasWidth()));
+		r.top    = std::clamp(static_cast<int>(std::floor(std::min(y0, y1))), 0, static_cast<int>(CanvasHeight()));
+		r.bottom = std::clamp(static_cast<int>(std::ceil(std::max(y0, y1))), 0, static_cast<int>(CanvasHeight()));
 		ys[ny++] = r.top;
 		ys[ny++] = r.bottom;
 	}
@@ -380,7 +389,7 @@ inline uint32_t Complement(const HW::Context& ctx, std::array<Rect, 32>& out) {
 		std::sort(spans.begin(), spans.begin() + ns);
 		int x = 0;
 		for (uint32_t s = 0; s <= ns; ++s) {
-			const int gap_end = s < ns ? spans[s].first : static_cast<int>(CanvasWidth);
+			const int gap_end = s < ns ? spans[s].first : static_cast<int>(CanvasWidth());
 			if (gap_end > x && count < out.size()) {
 				// (Merged with the rectangle above of the same columns.)
 				const auto above = std::find_if(out.begin(), out.begin() + count, [&](const Rect& r) {
@@ -442,14 +451,14 @@ public:
 		const auto&  viewport = screen.viewports[0];
 		// (A marker over the world: held to the centre, MarkerArea.)
 		const auto&  a        = area < Areas.size() ? Areas[area] : Area {-1.0f, 1.0f, -1.0f, 1.0f, 0.0f};
-		const auto   width    = std::max(CanvasWidthOf(ctx), CanvasWidth);
+		const auto   width    = std::max(CanvasWidthOf(ctx), CanvasWidth());
 		m_ctx                 = &ctx;
 		m_xscale              = viewport.xscale;
 		m_xoffset             = viewport.xoffset;
 		// Where the draw lands, as a window x' = scale * x + shift of the x it is drawn at.
 		float scale = 1.0f, shift = 0.0f;
-		if (width != CanvasWidth) {
-			shift = static_cast<float>(width - CanvasWidth) * (a.side + 1.0f) / 2.0f;
+		if (width != CanvasWidth()) {
+			shift = static_cast<float>(width - CanvasWidth()) * (a.side + 1.0f) / 2.0f;
 		} else {
 			scale = static_cast<float>((16.0 / 9.0) / wide);
 			shift = (m_xoffset + a.side * m_xscale) * (1.0f - scale);
@@ -472,7 +481,7 @@ public:
 			// The area's corners in window pixels, where the viewport now places them (the wide output's layout: 3840
 			// wide at the left edge).
 			const auto drawn_x  = [&](float x) {
-				return width != CanvasWidth ? (x + 1.0f) * (CanvasWidth / 2.0f) : m_xoffset + x * m_xscale;
+				return width != CanvasWidth() ? (x + 1.0f) * (CanvasWidth() / 2.0f) : m_xoffset + x * m_xscale;
 			};
 			const auto window_x = [&](float x) { return scale * drawn_x(x) + shift; };
 			const auto window_y = [&](float y) { return viewport.yoffset + y * viewport.yscale; };
@@ -510,13 +519,13 @@ private:
 
 // A draw into the wide output's interface canvas in a frame showing the 3D: widened (StretchScope) unless it is the HUD's.
 inline bool Stretched(const HW::Context& ctx) {
-	if (g_state.canvas == 0 || !FrameGen::SceneNoted() || CanvasWidthOf(ctx) <= CanvasWidth) return false;
+	if (g_state.canvas == 0 || !FrameGen::SceneNoted() || CanvasWidthOf(ctx) <= CanvasWidth()) return false;
 	return ctx.GetRenderTarget(0).base.addr == g_state.canvas;
 }
 
 // A rectangle of the 3840 wide layout where StretchScope's widening puts it.
 inline Rect Widened(const Rect& rect) {
-	const float k = static_cast<float>(WideWidth()) / CanvasWidth;
+	const float k = static_cast<float>(WideWidth()) / CanvasWidth();
 	return {static_cast<int>(std::floor(rect.left * k)), rect.top, static_cast<int>(std::ceil(rect.right * k)), rect.bottom};
 }
 
@@ -528,7 +537,7 @@ class StretchScope {
 public:
 	StretchScope(HW::Context& ctx, const HW::PixelShaderInfo& ps): m_ctx(&ctx), m_screen(ctx.GetScreenViewport()) {
 		const auto  width    = static_cast<int>(WideWidth());
-		const float k        = static_cast<float>(width) / CanvasWidth;
+		const float k        = static_cast<float>(width) / CanvasWidth();
 		const auto& viewport = m_screen.viewports[0];
 		const auto  widen    = [&](int x) { return std::clamp(static_cast<int>(std::lround(x * k)), 0, width); };
 		ctx.SetViewportXScale(0, viewport.xscale * k);

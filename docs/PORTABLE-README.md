@@ -45,7 +45,7 @@ CPUs ...". To leave everything to Windows instead: `run.cmd -Set KYTY_RECORDING_
 The game starts with the table path: most draws and compute dispatches read their resources straight
 from GPU memory instead of descriptor sets the emulator builds for each of them (Boletaria standing
 about 45 → 50–53 fps). The first visit to an area compiles its pipelines in the background, so the
-gain grows as you play. To start without it: `run.cmd -Set KYTY_TABLE_XPR=,KYTY_TABLE_DISPATCH=`.
+gain grows as you play. To start without it: `run.cmd -Set KYTY_TABLE_XPR=0,KYTY_TABLE_DISPATCH=0`.
 
 ## Where to put the game files
 
@@ -61,11 +61,31 @@ folder (usually named `PPSA01341-app0`).
   too, read without extracting it: choose it with the launcher's `.zar...` button, or run
   `run.cmd -Game "D:\Games\PPSA01341-app0.zar"`. Pack it with `zarchive.exe <folder> <file.zar>`
   (ZArchive, https://github.com/Exzap/ZArchive/releases). The folder stays the main way.
+- On a hard disk (HDD): pack the game into a `.zar` there and keep the emulator folder (with its
+  `_PipelineCache`, about 6 GB) on an SSD. Unpacked on a busy hard disk, every small read of the game
+  waited 100-500 ms: long area loads and freezes while walking; packed, with the emulator on the SSD, it
+  ran at full speed ([#91](https://github.com/chenxiao07/KytyPS5/issues/91)).
+
+### Add-on content (DLC)
+
+- Add-ons with files of their own: one folder each in `Content\PPSA01341\` inside the emulator folder,
+  holding the add-on's unpacked files (with its `sce_sys\param.json`). The game is told it owns them.
+- Add-ons without files (a deluxe edition's extras, say): one section each in `dlc_emu.ini` in the
+  emulator folder, with the add-on's content id:
+
+  ```ini
+  [PSAL]
+  content_id=EP9000-PPSA01341_00-XXXXXXXXXXXXXXXX
+  download_status=NO_EXTRA_DATA
+  service_label=0
+  ```
+
+- The run log lists each add-on the game is told it owns (`NpEntitlementAccess: ... reported as owned`).
 
 ## Starting the game
 
 **Double-click `launcher.cmd`** for a small settings window: the game folder, the resolution with the
-aspect ratio, render height and upscaler beside it, fullscreen (optionally keeping the aspect ratio with
+aspect ratio, render height, upscaler and game output beside it, fullscreen (optionally keeping the aspect ratio with
 black bars), the console language and red-zone protection,
 with buttons to play, to precompile the shaders (optionally on the efficiency cores only, so the PC
 stays responsive), and to open the logs folder. It remembers the settings (`launcher-settings.json`).
@@ -78,7 +98,7 @@ display in Windows' display settings (the game is told the TV takes HDR); otherw
 "Render height" (1440 by default, as on the PS5) is the height the game renders its 3D at before it
 upscales it to its 4K picture; lower heights (1296, 1152, 1080, 900) are faster where the graphics card
 limits the frame rate (a laptop RTX 3080 at Boletaria's start: 20.7 fps at 1440, 24.8 at 1080) and
-less sharp. The interface stays 4K either way.
+less sharp. The interface keeps the game output's size either way.
 "Aspect ratio" (16:9 by default, as on the PS5) renders the 3D wider for ultrawide displays: 21:9
 (3416x1440 at render height 1440) or 32:9, seeing more to the sides, not a stretched 16:9 picture. In
 play the HUD keeps its shape: health, magic, stamina and the equipment at the left edge, the souls at
@@ -108,6 +128,12 @@ With an "Aspect ratio" wider than 16:9, DLSS makes the picture at its full width
 instead of a 3840x2160 picture widened on the screen. On an RTX 5090 at Boletaria's start that ran at 64.5 fps,
 the game's TAA at 21:9 at 59.3. Screens without the 3D (movies, the title, loading) are stretched to the
 width, as without DLSS.
+"Game output" (4K by default, as on the PS5) with "1080p" runs the game's own HD mode, the one a PS5 takes on
+a 1080p TV: its post-processing and HUD at 1920x1080 instead of 3840x2160 scaled down to the window afterwards,
+and its 3D at most 1080 high (a higher render height is lowered to 1080). Less work for the graphics card: at
+Boletaria's start on an RTX 5090, 69.8 fps at 4K, 78.3 at 1080p. It suits 1080p screens; on larger ones the
+picture is softer than the 4K output's. DLSS makes the 4K output, so with "DLSS (PS5 Pro path)" this row stays
+at 4K.
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
@@ -167,7 +193,8 @@ shortcut):
 | `-Game <folder>` | The game folder (or a `.zar` archive of it) |
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
 | `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
-| `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides; in-game menus, movies and loading screens are stretched to the width |
+| `-HdOutput` | The game's own 1080p output (the launcher's "Game output: 1080p"): post-processing and HUD at 1920×1080, the 3D at most 1080 high; not with `-Upscaler dlss` |
+| `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides; in-game menus, movies and loading screens are stretched to the width (with `-AspectFit` too: movies, the title and loading screens keep their 16:9, with black bars at the sides) |
 | `-Quality low` | How much the game draws: `low` or `lowest` (shorter shadows, simpler distant detail), faster where the processor limits the frame rate |
 | `-TextureReduce 2` | Large textures without their largest levels: `1` half the size per side (the default with less than 12 GB of video memory), `2` a quarter, `0` whole |
 | `-Fps120` | The game's frame rate up to 120 fps instead of 60 (the launcher's "Up to 120 fps") |
@@ -275,12 +302,33 @@ Default keyboard layout:
 | Enter | OPTIONS |
 | Backspace / Tab | Left / right half of the touch pad |
 | F7 | Camera with the mouse (press again to release the mouse) |
-| Space | **Pause / resume the emulation** (careful not to hit it by accident) |
+| Space, Pause | **Pause / resume the emulation** (careful not to hit Space by accident; once your own keys give Space to the game, only Pause) |
 | F8 | The emulator's overlay: Off, Frame rate, Detailed (the launcher's "Overlay" is where it starts) |
 | F9 | **Debug snapshot**: pauses the game and saves the picture on screen and where you are (`_DebugSnapshots\<date-time>\`: `screen.png`, `info.txt` with the position, the run's log and the switches); F9 again resumes. Attach the folder to an issue when something looks wrong |
 | F11, Alt+Enter | Toggle full screen |
 
 The keyboard has no L2 / R2 by default: use a gamepad when you need them.
+
+### Your own keys
+
+Add `"--keymap", "<control>=<key>"` pairs to the `"command"` list in `launch.json` (after `"kyty_emulator.exe"`).
+With any of them, only your own keys work on the keyboard (none of the layout above):
+
+```json
+"--keymap", "LeftStickUp=W",
+"--keymap", "Circle=Space",
+"--keymap", "L1=Left Shift",
+"--keymap", "R1=Mouse:Left",
+"--keymap", "MouseSensitivity=1.5",
+```
+
+- Controls: `Cross Circle Square Triangle L1 R1 L2 R2 L3 R3 Options Up Down Left Right TouchPad TouchPadRight`,
+  `LeftStickUp/Down/Left/Right`, `RightStickUp/Down/Left/Right`.
+- Keys: their names on the keyboard (`E`, `Tab`, `Space`, `Escape`, `Left Shift`, `Left Ctrl`, `Return`, ...; also
+  written without the space, as `LeftShift`), or `Mouse:Left`, `Mouse:Right`, `Mouse:Middle`, `Mouse:X1`, `Mouse:X2`.
+- F7, F8, F9 and F11 stay the emulator's. A line it cannot use is skipped, and the run log says which and why
+  (`Input mapping skipped: ...`).
+- An update's `launch.json` replaces yours: keep a copy of your lines.
 
 ## Files and folders
 
@@ -294,9 +342,10 @@ The keyboard has no L2 / R2 by default: use a gamepad when you need them.
 | `game-path.txt` | The remembered game location |
 | `seeds-<title>_<version>.seeds` | The list of shaders the first launch collects from the game files (one per game version) (it contains the game's shader code: do not share it), for the precompile |
 | `hinted-<title>_<version>.seeds` | The recorded play of the package's hints and of your own play with the code of your game files (made by each precompile, from `released-<title>_<version>.seeds` and `recorded-play-<title>_<version>.hints`; the `.seeds` files contain the game's shader code: do not share them) |
-| `launch.json` | The emulator's switches; normally left alone |
+| `launch.json` | The emulator's command line and extra switches; normally left alone |
 | `launcher-settings.json` | The launcher's settings |
 | `_DebugSnapshots` | The F9 debug snapshots (picture, position, log), to attach to an issue |
+| `Content\<title>`, `dlc_emu.ini` | Add-on content (DLC), if you add it (see "Add-on content") |
 
 ## Updating to a newer package
 

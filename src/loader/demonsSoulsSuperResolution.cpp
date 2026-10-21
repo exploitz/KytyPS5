@@ -1,4 +1,5 @@
 #include "loader/demonsSoulsSuperResolution.h"
+#include "loader/demonsSoulsHdOutput.h"
 
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "loader/guestCode.h"
@@ -32,6 +33,11 @@ void Install(Program* program) {
 	if (upscaler == nullptr || std::string_view(upscaler) != "dlss" || program == nullptr ||
 	    !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
+	if (DemonsSoulsHdOutput::Active()) {
+		std::printf("Demon's Souls super resolution: off with the HD output (KYTY_HD_OUTPUT: the PS5 Pro path's output is "
+		            "4K); the game's own TAA kept\n");
+		return;
+	}
 	// (The device exists by now: without DLSS on it, the game's own TAA rather than a stretch without anti-aliasing.)
 	if (!Libs::Graphics::FrameGen::UpscalerReady()) {
 		std::printf("Demon's Souls super resolution: DLSS is not available here (an NVIDIA RTX GPU and NVIDIA's DLSS "

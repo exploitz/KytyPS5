@@ -48,7 +48,7 @@
 #endif
 
 extern "C" {
-[[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {0};
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {1};
 }
 
 namespace Libs::Graphics {

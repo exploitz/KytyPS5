@@ -134,8 +134,6 @@ endif()
 project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
 
 include_directories(
-	${KYTY_THIRD_PARTY_DIR}/gtest/include
-	${KYTY_THIRD_PARTY_DIR}/gtest
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/magic_enum/include/magic_enum
 	${PROJECT_BINARY_DIR}
@@ -209,6 +207,18 @@ if(KYTY_CLANG_CL)
 		add_compile_options(-fprofile-instr-generate)
 		add_compile_definitions(KYTY_PGO_GENERATE=1)
 		link_libraries("${kyty_profile_runtime}")
+	elseif(KYTY_PGO_USE)
+		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+	endif()
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+	# Linux: the same PGO switches. The profile must be made on Linux (tools/pgo is clang-cl's).
+	option(KYTY_PGO_GENERATE "Instrumented build; the live command `pgo <file>` writes the profile" OFF)
+	set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
+	if(KYTY_PGO_GENERATE)
+		add_compile_options(-fprofile-instr-generate)
+		add_link_options(-fprofile-instr-generate)
+		add_compile_definitions(KYTY_PGO_GENERATE=1)
 	elseif(KYTY_PGO_USE)
 		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
 		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
@@ -852,7 +862,6 @@ configure_macos_guest_address_space(kyty_emulator)
 if(LINUX)
 	set_property(SOURCE
 		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/graphicsRun.cpp"
-		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/speculation.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandScheduler.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
 		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
@@ -892,8 +901,8 @@ endif()
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
 
-# Local frame generation experiments (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it
-# was unpacked under _Build/deps (never part of the repository). Its DLLs are loaded at run time.
+# Frame generation (src/local/frame-gen.cpp): the NVIDIA Streamline SDK when it was unpacked under _Build/deps
+# (never part of the repository). Its DLLs are loaded at run time.
 if (WIN32)
 	set(KYTY_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH
 	    "NVIDIA Streamline SDK for KYTY_FRAMEGEN (local only)")
@@ -962,8 +971,7 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 
 # x86_64 Linux and Windows: the Vulkan recording worker (KYTY_VULKAN_RECORDING, with the
-# native XPR draws built on it) and the native resource preparation tests (the
-# ahead-of-time SRT library is loaded with dlopen on Linux, LoadLibrary on Windows).
+# native XPR draws built on it) and the native resource preparation tests.
 if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 	find_package(Python3 REQUIRED COMPONENTS Interpreter)
 	set(recording_generated "${CMAKE_CURRENT_BINARY_DIR}/local-vulkan-recording.inc")
@@ -992,7 +1000,6 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 			resource_tracking_tests resource_materialization_tests virtual_memory_allocation_tests pad_input_tests)
 		target_sources(${native_resource_target} PRIVATE "${lod_stats_pack_header}")
 		target_compile_definitions(${native_resource_target} PRIVATE KYTY_LOCAL_NATIVE_RESOURCES=1)
-		target_link_libraries(${native_resource_target} ${CMAKE_DL_LIBS})
 	endforeach()
 	if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_LINKER MATCHES "ld.lld$")
 		# Clang otherwise selected GNU ld/LLVMgold despite CMAKE_LINKER, which

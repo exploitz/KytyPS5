@@ -1,7 +1,7 @@
 #pragma once
 // Local measurement hook (KYTY_LIVE_FILE): one boot, many same-process A/B experiments.
 // A side thread polls the command file every 100 ms and runs its commands once per new
-// "id N" first line, printing LIVE_* lines to stdout (tools/local/live-bench.py).
+// "id N" first line, printing LIVE_* lines to stdout (tools/local/bench-windows.py).
 //   poke32 <host address> <hex>   write a switch (live-bench resolves `sym NAME VALUE`)
 //   peek <host address> <bytes>   hex dump (<= 256 bytes)
 //   measure <seconds> <label>     presented frames, fps, per-frame CPU of the render and

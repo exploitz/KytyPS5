@@ -234,8 +234,9 @@ The shortest way to a Release build of the emulator (without the Qt launcher):
    powershell -ExecutionPolicy Bypass -File .\run-windows.ps1 -Game "D:\Games\PPSA01341-app0"
    ```
 
-   The emulator switches come from `run-windows.json`; `-DryRun` prints the environment and the
-   command, `-Fullscreen`, `-Width`/`-Height` and the others are listed at the top of the script.
+   The emulator's switches default to the release settings (`src/local/performance-switches.h`;
+   `-Set KYTY_NAME=value` changes one); `-DryRun` prints the environment and the command,
+   `-Fullscreen`, `-Width`/`-Height` and the others are listed at the top of the script.
    A ZArchive of the folder (`-Game D:\Games\PPSA01341-app0.zar`) works too, read without extracting
    it; `.\build-windows.cmd zarchive_tool` builds the packer, `_Build\windows\3rdparty\zarchive.exe
    <folder> <file.zar>`.
@@ -327,6 +328,21 @@ As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rej
 time.
 
 The CMake source root is the repository root.
+
+#### PGO on Linux
+
+`tools/pgo/kyty.profdata` is made by clang-cl and matches almost nothing in a Linux build (MSVC-mangled names), so
+a Linux PGO build needs its own profile. Use fresh build directories: `KYTY_CMAKE_ARGS` only applies to the first
+configure.
+
+1. An instrumented build: `KYTY_BUILD_DIR=_Build/linux-pgogen KYTY_CMAKE_ARGS=-DKYTY_PGO_GENERATE=ON ./build-linux.sh`
+2. Play with it for 10-15 minutes (it runs slower). The emulator exits without writing a profile, so write it with
+   the live command `pgo <file>`: start the emulator with `KYTY_LIVE_FILE=<command file>` and put
+   `id <n>` and `pgo /absolute/path/kyty.profraw` on two lines in that file, with a new `id` each time. The counters
+   add up, so the last write has the whole session. Don't give `KYTY_LIVE_FILE` to `run_ds.sh`: its stutter capture
+   writes to the same file. Set it in a small wrapper script passed as `KYTY_BIN` instead.
+3. Merge and build: `llvm-profdata merge -o kyty-linux.profdata *.profraw`, then
+   `KYTY_BUILD_DIR=_Build/linux-pgo KYTY_CMAKE_ARGS=-DKYTY_PGO_USE=$PWD/kyty-linux.profdata ./build-linux.sh`
 
 ### Building on macOS
 
@@ -486,7 +502,8 @@ Code from these contributors is part of this branch. Thank you!
   ([#3](https://github.com/chenxiao07/KytyPS5/pull/3); its commits carry the author name "CachyOS", mapped in `.mailmap`).
 - [@Myoko](https://github.com/Myoko): DualSense haptics and a resizable window ([#18](https://github.com/chenxiao07/KytyPS5/pull/18)),
   add-on content ([#25](https://github.com/chenxiao07/KytyPS5/pull/25)), CJK text in the save dialogs
-  ([#75](https://github.com/chenxiao07/KytyPS5/pull/75)).
+  ([#75](https://github.com/chenxiao07/KytyPS5/pull/75)), license-only add-ons and checked add-on ids
+  ([#104](https://github.com/chenxiao07/KytyPS5/pull/104)).
 - [@todojuegos67-bot](https://github.com/todojuegos67-bot): wave OR in pixel shaders, the water in Demon's Souls
   ([#19](https://github.com/chenxiao07/KytyPS5/pull/19)).
 - [@MikeSee0](https://github.com/MikeSee0): Windows build tool selection ([#39](https://github.com/chenxiao07/KytyPS5/pull/39)).
@@ -497,3 +514,4 @@ Code from these contributors is part of this branch. Thank you!
   HUD-less frame generation ([#72](https://github.com/chenxiao07/KytyPS5/pull/72)), save bookkeeping after a power cut
   ([#74](https://github.com/chenxiao07/KytyPS5/pull/74)).
 - [@Sandermand](https://github.com/Sandermand): AudioOut2 catch-up ([#68](https://github.com/chenxiao07/KytyPS5/pull/68)).
+- [@intellq](https://github.com/intellq): Demon's Souls' own 1080p output ([#103](https://github.com/chenxiao07/KytyPS5/pull/103)).
