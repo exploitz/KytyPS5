@@ -33,36 +33,7 @@
 #include <span>
 #include <utility>
 
-// KYTY_LANE_LOCAL_TITLE=live: 1 here (`set kyty_local_lane_local_title 1`) makes the title list's permutations made from
-// then on lane-local; the permutations of each side are kept apart (pipelineCache.cpp), so a flip back finds its own.
-extern "C" {
-[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_lane_local_title {0};
-}
-
 namespace Libs::Graphics::ShaderRecompiler {
-
-namespace {
-const char* LaneLocalTitleSwitch() {
-	static const char* value = std::getenv("KYTY_LANE_LOCAL_TITLE");
-	return value != nullptr ? value : "";
-}
-} // namespace
-
-bool LaneLocalTitleDefault() {
-	return LaneLocalTitleSwitch()[0] == '1';
-}
-
-bool LaneLocalTitleLive() {
-	return std::string_view(LaneLocalTitleSwitch()) == "live";
-}
-
-bool LaneLocalTitleLiveOn() {
-	return LaneLocalTitleLive() && kyty_local_lane_local_title.load(std::memory_order_relaxed) != 0;
-}
-
-bool LaneLocalTitleProgram(uint64_t hash) {
-	return Frontend::LaneLocalTitleProgram(hash);
-}
 
 
 namespace {
@@ -755,7 +726,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .pixel               = pixel,
 	    .compute             = compute,
 	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
-	    .lane_local_title    = options.lane_local_title,
 	};
 	PHASE_LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
