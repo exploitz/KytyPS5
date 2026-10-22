@@ -70,6 +70,9 @@ extern "C" {
 // mapping its other parts again (GuestBackingStore::UnmapOne); 2: parked no-access (a stray access faults, for
 // debugging). 0: views with nothing parked yet are split at once, as before (a view holding parked ranges keeps parking).
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_park_unmaps {1};
+// 1: the GPU side's unmap before a range is reserved or mapped runs over ranges it holds nothing of too, as before
+// (UnmapGpuRangeIfHeld).
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_unused_gpu_unmaps {0};
 }
 
 namespace VirtualMemory = Common::VirtualMemory;
@@ -1514,6 +1517,26 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	}
 
 	return false;
+}
+
+static bool OverlapsPrtAperture(uint64_t address, uint64_t size) {
+	Common::LockGuard lock(g_prt_aperture_mutex);
+	return std::any_of(g_prt_apertures.begin(), g_prt_apertures.end(), [&](const PrtAperture& aperture) {
+		return aperture.size != 0 && VirtualRangesOverlap(address, size, aperture.address, aperture.size);
+	});
+}
+
+// The GPU side's unmap of [vaddr, vaddr + size) before it is reserved or mapped, where it may hold something: a mapped
+// part, or a PRT aperture over it (its images read pages nothing maps). Elsewhere it holds nothing: the unmap that freed
+// or reserved the range dropped all of it, buffers are made over mapped ranges only, and a map invalidates the images
+// over its range (TextureCache::MapMemory). Each one skipped is a render-thread round trip: ~5 ms over a large
+// reservation of the game's (~70 a level load, 257 at boot), ~0.1 ms before each of its direct maps (~11K a session).
+static void UnmapGpuRangeIfHeld(uint64_t vaddr, uint64_t size) {
+	if (kyty_local_unused_gpu_unmaps.load(std::memory_order_relaxed) == 0 && g_gpu_resources != nullptr &&
+	    IsGpuAddressRange(vaddr, size) && !g_gpu_resources->AnyMapped(vaddr, size) && !OverlapsPrtAperture(vaddr, size)) {
+		return;
+	}
+	UnmapGpuRange(vaddr, size);
 }
 
 bool RestoreGuestWritable(uint64_t vaddr, uint64_t size) {
@@ -3632,7 +3655,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			UnmapGpuRangeIfHeld(in_addr, len);
 			residency_lock.lock();
 			consumed_range = reserved_ranges.front();
 			if (g_virtual_ranges->ConsumeReservedSpan(in_addr, len)) {
@@ -3661,7 +3684,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			UnmapGpuRangeIfHeld(in_addr, len);
 			residency_lock.lock();
 			consumed_range = reserved_ranges.front();
 			if (g_virtual_ranges->ConsumeReservedSpan(in_addr, len)) {
@@ -3676,7 +3699,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 			if (residency_lock.owns_lock()) residency_lock.unlock();
 			out_addr = FindGuestFreeRange(in_addr, len, alignment);
 			if (out_addr != 0) {
-				UnmapGpuRange(out_addr, len);
+				UnmapGpuRangeIfHeld(out_addr, len);
 				residency_lock.lock();
 				shared_backing = map_shared_fixed(out_addr);
 				if (!shared_backing) {
@@ -4074,7 +4097,7 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 		alignment = (alignment != 0 ? alignment : PAGE_SIZE);
 		out_addr  = FindGuestFreeRange(in_addr, len, alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len);
+			UnmapGpuRangeIfHeld(out_addr, len);
 		}
 	}
 

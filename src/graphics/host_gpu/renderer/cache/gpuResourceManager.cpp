@@ -185,6 +185,16 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+bool GpuResourceManager::AnyMapped(uint64_t vaddr, uint64_t size) const noexcept {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	bool             any = false;
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachIntersection(vaddr, size, [&](RangeSet::Range) { any = true; });
+	return any;
+}
+
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	const auto map = [this, vaddr, size] {
 		m_texture_cache.MapMemory(vaddr, size);
