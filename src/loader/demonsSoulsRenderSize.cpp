@@ -210,7 +210,7 @@ void Install(Program* program) {
 		            "upscaler); 16:9\n");
 		aspect = 0.0;
 	}
-	if (trinity && !hd_pro && requested >= 720 && requested < SuperResolutionLeastHeight) {
+	if (trinity && !hd_pro && requested >= LeastRenderHeight && requested < SuperResolutionLeastHeight) {
 		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%u is below the game's super resolution (1080 at "
 		            "least); 1080 instead\n",
 		            requested);
@@ -226,8 +226,8 @@ void Install(Program* program) {
 		size = lower;
 	}
 	if (size.height == 0) {
-		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%s is not 720-2160; the game's %ux%u kept\n", setting,
-		            game_width, game_height);
+		std::printf("Demon's Souls render size: KYTY_RENDER_HEIGHT=%s is not %u-2160; the game's %ux%u kept\n", setting,
+		            LeastRenderHeight, game_width, game_height);
 		return;
 	}
 	auto constant = hd ? FindRenderConstant(*program, ModeCase, ModeWidths[mode], ModeHeights[mode], out_width, out_height)

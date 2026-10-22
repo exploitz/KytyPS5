@@ -87,6 +87,7 @@ param(
 	[string]$StreamlineDir = '',
 	[switch]$Fsr,
 	[string]$Affinity = '',
+	[string]$Gpu = '',
 	[switch]$Prompt,
 	[switch]$Follow,
 	[switch]$DryRun
@@ -263,6 +264,11 @@ if (!$environment.Contains('KYTY_RENDER_CPUS')) { $environment['KYTY_RENDER_CPUS
 if ($RenderHeight -gt 0) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # -HdOutput: the game's 1080p output (src/loader/demonsSoulsHdOutput.h). A 1440 render height (the default) becomes 1080.
 if ($HdOutput) { $environment['KYTY_HD_OUTPUT'] = '1' }
+# -Gpu: the graphics card on a PC with more than one, its number in the log's "Vulkan GPU <n>:" list or a part of its
+# name (-Gpu 4090); without it the first discrete GPU, in the order Windows' graphics settings give (issue #132). Give
+# precompile-windows.ps1 the same -Gpu: the pipelines are compiled for one card.
+# (Set here already: the precompile program's runs below, the prefetch inputs, are made for that card too.)
+if ($Gpu) { $environment['KYTY_GPU'] = $Gpu; $env:KYTY_GPU = $Gpu }
 # -Aspect 21:9 (or 32:9, w:h): the 3D rendered at that aspect, its width at the render height (3416x1440), the game's
 # projection widened to match; the presenter shows every frame at the aspect (movies and menus stretched).
 if ($Aspect -and $Aspect -ne '16:9') { $environment['KYTY_RENDER_ASPECT'] = $Aspect }

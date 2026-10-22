@@ -50,7 +50,7 @@ $settings = [ordered]@{ game = ''; resolution = '2560x1440'; fullscreen = $false
 	ecores = $false; fps120 = $false; render = 1440; ratio = '16:9'; quality = 'standard'; vsync = $false; hdr = $false; framegen = 0
 	hud = 0; streamline = ''; safegpu = $false; upscaler = ''; render_dlss = 1080; fsr = $false; output = '4k'
 	lowlatency = $false; present_direct = $false; antilag = $false; keep_resident = $false; fps30 = $false
-	extra_args = '' }
+	extra_args = ''; dlss_preset = ''; gpu = '' }
 if (Test-Path $settingsPath) {
 	$saved = Get-Content $settingsPath -Raw | ConvertFrom-Json
 	foreach ($property in $saved.PSObject.Properties) { if ($settings.Contains($property.Name)) { $settings[$property.Name] = $property.Value } }
@@ -336,6 +336,7 @@ function Get-PlayCommand {
 	# (DLSS makes the 4K output: the 1080p output only with the game's own upscale.)
 	if ($settings.output -eq '1080p') { $arguments += '-HdOutput' }
 	if ($frameGenAvailable -and ((!$fsrOn -and [int]$settings.framegen -ge 2) -or $dlss)) { $arguments += @('-StreamlineDir', "`"$streamline`"") }
+	$arguments += @(Get-GpuArguments)
 	# Switches of the config, one -Set argument (run-windows.ps1 splits it at the commas).
 	$sets = @()
 	# The emulator's panel (KYTY_FPS_HUD) at the top right of the game image: the frame rate and frame times, or with
@@ -348,6 +349,8 @@ function Get-PlayCommand {
 	if ($settings.antilag) { $sets += 'KYTY_ANTI_LAG=1' }
 	if ($settings.fps30) { $sets += 'KYTY_FLIP_RATE=1' }
 	if ($settings.keep_resident) { $sets += @('KYTY_RESIDENT_MB=6144', 'KYTY_WORKING_SET_TRIM=0') }
+	# KytyLauncher.exe's DLSS model (a preset letter; none: the DLSS version's own choice).
+	if ($dlss -and "$($settings.dlss_preset)" -cmatch '^[A-O]$') { $sets += "KYTY_DLSS_PRESET=$($settings.dlss_preset)" }
 	# KytyLauncher.exe's extra options (Advanced page): their -Set pairs join (or replace) the launcher's own.
 	$extra = Get-ExtraOptions
 	foreach ($option in $extra) {
@@ -401,10 +404,18 @@ function Get-ExtraOptions {
 	}
 	return , $options
 }
+# KytyLauncher.exe's graphics card (Advanced page, a PC with more than one), by its name, for the game and the precompile
+# alike (issue #132); one holding a character cmd would act on is left out.
+function Get-GpuArguments {
+	$gpu = "$($settings.gpu)"
+	if ($gpu -and $gpu.IndexOfAny([char[]]'&|<>^!%"') -lt 0) { return @('-Gpu', "`"$gpu`"") }
+	return @()
+}
 function Get-PrecompileCommand([string]$switch = '') {
 	$arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$root\precompile-windows.ps1`"")
 	if ($switch) { $arguments += $switch }
 	if ($settings.ecores -and $efficiencyMask -ne 0) { $arguments += @('-Affinity', $efficiencyMask) }
+	$arguments += @(Get-GpuArguments)
 	if ($settings.game) { $arguments += @('-Game', "`"$($settings.game)`"") }
 	return "$powershellCommand " + ($arguments -join ' ') + ' & pause'
 }

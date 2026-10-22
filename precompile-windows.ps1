@@ -59,6 +59,8 @@ param(
 	[int]$Threads = 3,
 	[int]$Shards = 512,
 	[int64]$Affinity = 0, # 0: the launch config's CPUs (this PC's leave out 4 and 5, where the compiler crashes), else all
+	# The graphics card to compile for on a PC with more than one: run-windows.ps1's -Gpu (a number or a part of its name).
+	[string]$Gpu = '',
 	[switch]$Coverage,
 	[switch]$Quick,
 	[switch]$Full,
@@ -71,6 +73,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path $Exe)) { throw "missing $Exe; build it with build-windows.cmd kyty_shader_precompile" }
+if ($Gpu) { $env:KYTY_GPU = $Gpu }
 # The AMD driver keys its pipelines (VK_KHR_pipeline_binary keys, its pipeline cache) by the executable's name: what
 # kyty_shader_precompile.exe compiled, kyty_emulator.exe never found (10-16, RX 9070 XT: 0 of every pipeline the game
 # made). The program runs named like the emulator (its DLLs next to it), on any GPU: a hard link in the emulator's
