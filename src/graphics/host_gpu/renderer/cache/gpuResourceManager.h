@@ -53,8 +53,6 @@ public:
 	// Before a host write of the range: the images over it only (their bytes are rewritten, as InvalidateMemory does).
 	[[nodiscard]] bool InvalidateImages(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
-	// Whether any part of [vaddr, vaddr + size) is mapped.
-	[[nodiscard]] bool AnyMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// The mapped parts of [vaddr, vaddr + size), added to `out`.
 	void               MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
