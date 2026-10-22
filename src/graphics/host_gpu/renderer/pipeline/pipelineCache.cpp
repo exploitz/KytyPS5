@@ -930,17 +930,16 @@ struct PipelineCache::ProgramCache {
 		}();
 		return verify;
 	}
-	// The switches the recompiler reads that change what it produces.
+	// The switches the recompiler reads that change what it produces, and the translation features in use (the static
+	// store's stamp and the GPU's: the shader fix, the cooperative halves...).
 	static std::string StoreSwitches() {
 		std::string text;
 		for (const char* name: {"KYTY_FRONT_FACE_FLOAT", "KYTY_PORTABLE_SHADERS", "KYTY_SRT_LINEAR_VERIFY",
-		                        "KYTY_EXEC_DEMAND", "KYTY_LANE_LOCAL", "KYTY_LANE_LOCAL_UNIFORM_LOADS",
-		                        "KYTY_PS_WAVE_OR"}) {
+		                        "KYTY_LANE_LOCAL", "KYTY_LANE_LOCAL_UNIFORM_LOADS", "KYTY_PS_WAVE_OR"}) {
 			const char* value = std::getenv(name);
-			// (The shader fix by its effect: unset and 1 translate alike since it is on by default.)
-			if (std::string_view(name) == "KYTY_EXEC_DEMAND") value = ShaderRecompiler::IR::ExecDemandEnabled() ? "1" : "0";
 			text += fmt::format("{}={};", name, value != nullptr ? value : "");
 		}
+		text += fmt::format("features={:#x};", ShaderRecompiler::Frontend::TranslatorFeatureSet());
 		return text;
 	}
 

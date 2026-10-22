@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ExecDemand.h"
 
+#include "graphics/shader/recompiler/frontend/translate/Translate.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <iterator>
@@ -652,11 +654,7 @@ uint32_t Analysis::Apply() {
 } // namespace
 
 bool ExecDemandEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_EXEC_DEMAND");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
+	return (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeatureExecDemand) != 0;
 }
 
 ExecDemandStats EliminateMaskedSelects(Program& program) {
