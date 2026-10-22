@@ -70,7 +70,7 @@ bool RaiseThreadPriority();
 // Another thread's priority by handle (CurrentThreadHandle): Windows THREAD_PRIORITY_* values (0 normal, 2 highest).
 bool SetThreadHandlePriority(uint64_t handle, int priority);
 // The calling thread above the normal priority of the game's threads (Windows: THREAD_PRIORITY_HIGHEST; Linux:
-// unchanged): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
+// nice -10 where the nice limit allows, unless KYTY_LINUX_FAST_LOCKS=0): the render thread, which every frame waits for, is not time-sliced against them on its CPUs.
 void MakeCriticalThread();
 
 // The refresh rate in Hz of the display a window is on (its HWND on Windows; 0 when unknown or elsewhere).

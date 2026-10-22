@@ -18,6 +18,9 @@
 #include "vulkan-recording.h"
 #endif
 #include "frame-gen.h"
+#include "screenshot.h"
+#include "anti-lag.h"
+#include "fsr-native.h"
 #include "frame-gen-hudless.h"
 #include "local-platform.h"
 #include "perf-overlay.h"
@@ -60,6 +63,7 @@ struct Presenter::Frame {
 	bool                   hdr          = false; // BT.2100 PQ pixels
 	bool                   blank        = false; // a cleared frame (no guest picture)
 	bool                   scene        = false; // the game's 3D view (FrameGen::TakeScene)
+	uint64_t               anti_lag_frame = 0;   // the frame AMD Anti-Lag numbered it (AntiLag::Flip), 0: none
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -563,7 +567,7 @@ struct Presenter::Impl {
 				std::snprintf(title.data(), title.size(), "%.0f FPS",
 				              (seconds >= 1.0 ? hud_frames / seconds : game) * presents);
 				std::snprintf(detail.data(), detail.size(), "%s Frame Generation %ux  |  game %.0f fps",
-				              FrameGen::UsesFsr() ? "FSR 3" : "DLSS", presents, game);
+				              FrameGen::UsesFsr() || FsrNative::InterpolationRequested() ? "FSR 3" : "DLSS", presents, game);
 			} else {
 				std::snprintf(title.data(), title.size(), "%.0f FPS", game);
 			}
@@ -762,7 +766,9 @@ struct Presenter::Impl {
 				    (static_cast<float>(hud->drawn.offset.x - region.offset.x) + static_cast<float>(hud->drawn.extent.width) + margin) / w,
 				    (static_cast<float>(hud->drawn.offset.y - region.offset.y) + static_cast<float>(hud->drawn.extent.height) + margin) / h);
 			}
-			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene, nullptr, &composed,
+			// (With the frame's inputs FSR 3 built in gets its HUD-less image too: FrameGen::RecordHudless.)
+			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay, frame.scene,
+			                                frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr, &composed,
 			                                composed_view);
 			if (FrameGen::HudlessOn() && !frame.reusing_last) {
 				FrameGen::ScaleHudless(window.graphic_ctx, command.Handle(), frame.fg, extent, swapchain.PresentRegion(),
@@ -791,9 +797,20 @@ struct Presenter::Impl {
 			}
 			const FrameGen::UpscaleImage backbuffer {composed.image, composed_view, vk::ImageLayout::eGeneral, format, extent,
 			                                         composed.usage, 0, 0};
-			count = FrameGen::Generate(command.Handle(), frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
+			count = FrameGen::Generate(window.graphic_ctx, command.Handle(), frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
 			                           backbuffer, swapchain.PresentRegion(), outputs);
+			// (A live `screenshot`: the finished frame and the frame generated before it.)
+			const auto shot      = Screenshot::Take();
+			auto       capture   = Screenshot::Record(window.graphic_ctx, command.Handle(), composed, shot);
+			auto       generated_capture =
+			    count > 0 && !shot.empty() ? Screenshot::Record(window.graphic_ctx, command.Handle(), generated[0], shot + ".gen.ppm")
+			                               : Screenshot::Pending {};
 			frame.present_tick = present_scheduler.Submit();
+			if (capture.buffer != VK_NULL_HANDLE || generated_capture.buffer != VK_NULL_HANDLE) {
+				present_scheduler.Wait(frame.present_tick);
+				Screenshot::Finish(window.graphic_ctx, capture);
+				Screenshot::Finish(window.graphic_ctx, generated_capture);
+			}
 		}
 
 		// The game's frame time (the time between its frames here), smoothed; long gaps (a load, a pause) left out.
@@ -839,11 +856,13 @@ struct Presenter::Impl {
 		}
 		if (ok) {
 			if (shown > 0 && !behind()) std::this_thread::sleep_until(start + spacing * shown);
+			AntiLag::Present(frame.anti_lag_frame);
 			ok = show(composed);
 		}
 		FrameGen::NotePresented(shown + 1);
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		window.UpdateTitle(shown + (ok ? 1u : 0u),
+		                   FsrNative::InterpolationRequested() || FrameGen::UsesFsr() ? "FSR 3 FG" : "DLSS-G");
 		frames.Release(&frame, true);
 		return true;
 	}
@@ -870,7 +889,9 @@ struct Presenter::Impl {
 			const int       refresh =
 			    display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0 ? mode.refresh_rate : 0;
 			min_present_interval = std::chrono::nanoseconds(refresh > 0 ? 1000000000LL / refresh : 0);
-			LOGF("Presents limited to the display refresh: %d Hz\n", refresh);
+			// (In release logs too: a refresh read wrong limits what is shown, the game's own frame rate unchanged; #129.)
+			std::printf("Presents limited to the display refresh: %d Hz\n", refresh);
+			std::fflush(stdout);
 		}
 		const auto now = std::chrono::steady_clock::now();
 		// A quarter of the interval as slack: a 60 Hz guest on a 60 Hz display flips at the same
@@ -1256,10 +1277,11 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	vk_command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
 	                     dst_image, vk::ImageLayout::eTransferDstOptimal, 1, &region,
 	                     vk::Filter::eLinear);
-	// KYTY_FRAMEGEN_BACKEND=fsr: the HUD-less image from this, before the system overlay (which counts as HUD then).
-	if (FrameGen::OwnsSwapchain() && target == nullptr) {
+	// KYTY_FRAMEGEN_BACKEND=fsr: the HUD-less image from this, before the system overlay (which counts as HUD then); the
+	// Windows backend's of the swapchain image, FSR 3 built in's of the composed frame (`target`).
+	if (fsr_inputs != nullptr && (FrameGen::OwnsSwapchain() ? target == nullptr : target != nullptr)) {
 		FrameGen::RecordHudless(m_window.graphic_ctx, vk_command, fsr_inputs, dst_image, m_extent,
-		                        m_present_region);
+		                        m_present_region, m_format);
 	}
 
 	vk::ImageMemoryBarrier to_present {};
@@ -1410,6 +1432,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	auto*             frame = m_impl->frames.Acquire();
 	frame->hdr              = hdr;
 	frame->blank            = false;
+	frame->anti_lag_frame   = AntiLag::Flip();
 	RenderLockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -1568,7 +1591,8 @@ RenderContext& Presenter::Renderer() const noexcept {
 }
 
 bool Presenter::FlipRateApplies(const Frame& frame) noexcept {
-	return !FrameGen::Enabled() || frame.fg.valid;
+	// The game's 3D view only (with frame generation, the frames carrying its inputs): a capped movie played at half speed.
+	return FrameGen::Enabled() ? frame.fg.valid : frame.scene;
 }
 
 bool Presenter::IsSceneFrame(const Frame& frame) noexcept {
@@ -1660,7 +1684,13 @@ void Presenter::Present(Frame& frame, bool reuse) {
 				FrameGen::ScaleHudless(m_impl->window.graphic_ctx, command.Handle(), frame.fg, swapchain.Extent(),
 				                       swapchain.PresentRegion(), swapchain.Format());
 			}
+			// (A live `screenshot`: the game's picture as the presenter got it.)
+			auto capture       = Screenshot::Record(m_impl->window.graphic_ctx, command.Handle(), frame.image, Screenshot::Take());
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+			if (capture.buffer != VK_NULL_HANDLE) {
+				m_impl->present_scheduler.Wait(frame.present_tick);
+				Screenshot::Finish(m_impl->window.graphic_ctx, capture);
+			}
 		}
 #if defined(_WIN32)
 		// The Windows driver waits in vkQueuePresentKHR, inside the kernel, for the semaphore's
@@ -1677,6 +1707,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			                        swapchain.Extent(), swapchain.PresentRegion(), swapchain.Format(),
 			                        swapchain.ImageCount());
 		}
+		if (!reuse) AntiLag::Present(frame.anti_lag_frame);
 		status = swapchain.Present();
 		if (generate) {
 			FrameGen::AfterPresent();

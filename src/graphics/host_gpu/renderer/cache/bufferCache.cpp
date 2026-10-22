@@ -10,6 +10,7 @@
 #include "parallel-pages.h"
 #include "readback-queue.h"
 #include "fresh-memory.h"
+#include "texture-offload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -1929,6 +1930,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 // The CPU-dirty pages of a mapped range copied into the buffer (the written ones then GPU-owned).
 void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written) {
+	// Texture bytes of an image that went come back asynchronously (texture-offload.h): read after they land, not the
+	// discarded pages' zeros (dark textures after a death's reload under a small video memory budget). The restore's
+	// download is submitted first; the offload worker writes the bytes back when the GPU is done.
+	if (TextureOffload::MustWaitBeforeRead(vaddr, size) && GuestGpu::IsGpuThread() && !CommandScheduler::InDeferredOperation()) {
+		TextureOffload::NoteReadWait(size);
+		m_scheduler.Flush();
+		TextureOffload::WaitRestores(vaddr, size);
+	}
 	// Reused per thread: the memory tracker refuses a nested upload (CheckNotInUploadCallback).
 	thread_local std::vector<vk::BufferCopy> copies;
 	copies.clear();

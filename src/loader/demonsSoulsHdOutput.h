@@ -15,7 +15,8 @@ struct Program;
 // 4K for modes 3-5) - each the same way: r_Wants4K, else r_Wants4K_Game (kept in the save), else a compiled 3. Each
 // gets the HD mode, its two overrides removed (a save's 4K mode would come back on loading it). The mode alone keeps
 // the 4K display buffers and the video settings' 3840x2160 ceilings (the 1080p picture in a corner of them): both made
-// 1920x1080. Excludes the PS5 Pro path (KYTY_UPSCALER: its output is 4K) and the wide output (KYTY_WIDE_OUTPUT).
+// 1920x1080. Excludes the wide output (KYTY_WIDE_OUTPUT). With the PS5 Pro path (KYTY_UPSCALER) only the interface's
+// part is taken: the 3D upscaled to a 1080p output there (loader/demonsSoulsSuperResolution.h).
 // (SharpEmu's TitleDisplayPatches found the same places in 01.004.000; these are 01.007.000's, found by their code.)
 namespace DemonsSoulsHdOutput {
 // KYTY_HD_OUTPUT is set (before Install: the other patches keep out of its way).

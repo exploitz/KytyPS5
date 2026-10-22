@@ -42,7 +42,9 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void                                                    UpdateTitle();
+	// Present thread, after a game frame: `presented` images shown for it (with frame generation more than one, the title
+	// then also shows their rate, named `generator`).
+	void                                                    UpdateTitle(uint32_t presented = 1, const char* generator = nullptr);
 	void                                                    Resize(uint32_t width, uint32_t height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
@@ -50,7 +52,8 @@ struct WindowContext {
 	void Run();
 	// SDL window operations must complete on the main thread.
 	void RunOnMainThread(std::function<void()> task);
-	// Queued for the main thread without waiting for it to run.
+	// The same without waiting for the main thread to run it (the present thread's title updates: the main loop can sit
+	// in SDL_WaitEvent for long, and a present that waited for it dropped the frames made meanwhile).
 	void PostToMainThread(std::function<void()> task);
 	void DrainMainThreadTasks();
 
@@ -69,6 +72,7 @@ struct WindowContext {
 	std::vector<std::function<void()>> main_tasks;            // guarded by main_task_mutex
 	uint64_t                           main_tasks_queued = 0; // guarded by main_task_mutex
 	uint64_t                           main_tasks_run    = 0; // guarded by main_task_mutex
+	std::atomic_bool                   title_posted      = false; // a title update waits for the main thread
 };
 
 } // namespace Libs::Graphics

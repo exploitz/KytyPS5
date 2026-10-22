@@ -2853,19 +2853,27 @@ PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
 }
 
 // A pipeline no cache holds: compiled unoptimized now (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) and optimized on a
-// worker, or optimized before its first use (up to seconds on NVIDIA). Unoptimized first only on NVIDIA, where it was
-// measured (~100x faster to compile) and tested. (An AMD RX 6700 XT's driver crash at the first compute pipelines,
-// which kept AMD out, was native wave64 on RDNA2: the unoptimized build was not the cause. Whether AMD's driver
-// compiles faster unoptimized is not measured yet: an RX 9070 XT took 18 s for each of four compute pipelines.)
-// KYTY_PIPELINE_FAST_BUILD=1 / 0 chooses either on any GPU.
+// worker, or optimized before its first use (up to seconds on NVIDIA). Unoptimized first on NVIDIA, where it was
+// measured (~100x faster to compile) and tested, and on Mesa's RADV: an RX 9070 XT with a cold cache (Mesa 26.2.5,
+// Boletaria 1-1 from the title, 105 s) stalled 17.8 s on compiles in 26 frames instead of 31.4 s in 51, and every one of
+// the 821 unoptimized pipelines was replaced by its optimized build. (An AMD RX 6700 XT's driver crash at the first
+// compute pipelines, which kept AMD's Windows driver out, was native wave64 on RDNA2: the unoptimized build was not the
+// cause; that driver is not measured yet.) KYTY_PIPELINE_FAST_BUILD=1 / 0 chooses either on any GPU.
 static PipelineBuild FirstBuild(const GraphicContext& graphics) {
 	static const int fast = [] {
 		const char* value = std::getenv("KYTY_PIPELINE_FAST_BUILD");
 		return value == nullptr ? -1 : (std::string_view(value) != "0" ? 1 : 0);
 	}();
-	constexpr uint32_t NvidiaVendor = 0x10DE;
-	const bool         nvidia       = graphics.GetPhysicalDeviceProperties().vendorID == NvidiaVendor;
-	return fast == 1 || (fast == -1 && nvidia) ? PipelineBuild::Fast : PipelineBuild::Full;
+	static const bool measured = [&] {
+		constexpr uint32_t NvidiaVendor = 0x10DE;
+		if (graphics.GetPhysicalDeviceProperties().vendorID == NvidiaVendor) return true;
+		vk::PhysicalDeviceDriverProperties driver {};
+		vk::PhysicalDeviceProperties2      properties {};
+		properties.pNext = &driver;
+		graphics.physical_device.getProperties2(&properties);
+		return driver.driverID == vk::DriverId::eMesaRadv;
+	}();
+	return fast == 1 || (fast == -1 && measured) ? PipelineBuild::Fast : PipelineBuild::Full;
 }
 
 // An unoptimized pipeline (PipelineBuild::Fast): `build` compiles the optimized one on a worker, into
@@ -3769,7 +3777,7 @@ static std::filesystem::path StaticCachePath() {
 // then those the last precompile translated with: _PipelineCache/static/<title>_<version>.features. The first are written
 // by a precompile whose last merge made the store of its own pipelines alone (--merge --prune), the second by the last
 // merge of any precompile (--stamp: with recorded play lost, or -Quick, some pipelines stay as they were: another run
-// would not make them, so the store is not out of date for that). None (an older store, none at all): 0.
+// would not make them, so the store is not out of date for that). None (an older store): 0.
 static std::filesystem::path StaticFeaturesPath() {
 	return std::filesystem::path("_PipelineCache") / "static" / (PipelineCacheGameId() + ".features");
 }
@@ -3890,7 +3898,13 @@ void PipelineCache::InitializeStaticCache(bool create) {
 	// features it translated with, and offers itself again until then (StaticCacheCurrent).
 	if (!create) {
 		namespace Translate = ShaderRecompiler::Frontend;
-		Translate::SetTranslatorFeatures(ReadStaticFeatures());
+		// No store at all (none of its files): no pipeline of one to miss, the translation keeps all of this GPU's
+		// features, as the precompile translates.
+		std::error_code error;
+		const auto      exists = [&](const std::filesystem::path& path) { return std::filesystem::exists(path, error); };
+		if (exists(StaticFeaturesPath()) || exists(StaticCachePath()) || exists(StaticBinariesPath()) ||
+		    exists(StaticBlobsPath()))
+			Translate::SetTranslatorFeatures(ReadStaticFeatures());
 		if (const auto off = Translate::TranslatorDeviceFeatures() & ~Translate::TranslatorFeatureSet(); off != 0)
 			PipelineCacheLog("Translation features {:#x} off: the static pipeline store was made without them (precompile "
 			                 "again to use them)",

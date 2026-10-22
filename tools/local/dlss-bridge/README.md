@@ -20,6 +20,11 @@ tools/local/dlss-bridge/build-dlss-linux.sh   # libkyty_dlss.so and NVIDIA's lib
 `build-dlss-linux.sh` fetches the DLSS SDK (github.com/NVIDIA/DLSS, NVIDIA's license) into `_Build/deps/dlss-sdk`
 the first time. Other folders can get the libraries too: `build-dlss-linux.sh _Build/linux /path/to/release`.
 
+The Linux package carries none of NVIDIA's files: it has the bridge's source (`dlss-bridge/`) and
+`get-dlss-linux.sh`, which downloads the SDK and builds the bridge on the user's PC with git and a C++ compiler alone
+(no CMake; when missing, it offers to install them with the distribution's package manager), next to the package's
+`kyty_emulator`.
+
 ## Run
 
 DLSS replaces Sony's PS5 Pro upscaler on Demon's Souls' PS5 Pro path, whose output is 3840x2160; the mode follows the

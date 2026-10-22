@@ -133,6 +133,8 @@ void SetStaticRect(float x0, float y0, float x1, float y1);
 // queues of its own, GraphicContext::fsr_*), so the swapchain's calls go through it.
 // After Initialize: FSR asked for and its runtime loaded (device creation then adds its queues).
 [[nodiscard]] bool UsesFsr();
+// FSR generates frames, by the Windows backend or built in (Linux): the interface canvas is looked for (NoteUiCanvas).
+[[nodiscard]] bool FsrMarksHud();
 // The video memory FSR takes beside the game's (FidelityFX's allocations, outside the emulator's allocator, and its
 // HUD images): what the emulator leaves it when it sizes its use of the budget (small_video_memory).
 [[nodiscard]] uint64_t FsrVideoMemoryReserve();
@@ -162,8 +164,9 @@ void NoteUiCanvas(uint64_t address);
 // Present thread, in the frame's present commands right after the game image is blitted into `backbuffer`
 // (transfer-destination layout, left so): FSR's HUD-less image of the frame, the backbuffer with the HUD darkened
 // (FSR then takes the HUD's pixels from the game's frame). Before the system overlay: that counts as HUD too.
+// `format`: the backbuffer's (FSR 3 built in, Linux; the Windows backend uses its swapchain's).
 void RecordHudless(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs, vk::Image backbuffer,
-                   vk::Extent2D extent, vk::Rect2D region);
+                   vk::Extent2D extent, vk::Rect2D region, vk::Format format);
 
 // Renderer thread (Kyty.Gpu).
 // The guest frame ran the TAA pass: the game's 3D view (play, or a cutscene in the engine), not a movie, a menu or a
@@ -211,6 +214,8 @@ struct UpscaleImage {
 	vk::Extent2D        extent {};
 	vk::ImageUsageFlags usage {};
 	uint32_t            base_level = 0, base_layer = 0; // the subresource the view shows
+	vk::Format          image_format = vk::Format::eUndefined; // the image's own when it differs (a depth image's
+	                                                            // D32S8 under an R32 view): for upscalers making views
 };
 struct UpscaleInputs {
 	UpscaleImage color, depth, motion, output; // color, depth and motion at the render size
@@ -227,15 +232,16 @@ struct UpscaleInputs {
 [[nodiscard]] bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs,
                            const vk::detail::DispatchLoaderDynamic& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER);
 
-// Linux (NVIDIA NGX, kyty-dlss-bridge.h): Streamline makes and shows the generated frames inside vkQueuePresentKHR on
-// Windows; here the presenter shows them itself (swapchain.cpp). True once DLSS-G is ready that way.
+// Linux (NVIDIA NGX, kyty-dlss-bridge.h, or FSR 3 built in, fsr-native.h): Streamline makes and shows the generated
+// frames inside vkQueuePresentKHR on Windows; here the presenter shows them itself (swapchain.cpp). True once DLSS-G or
+// FSR 3 is ready that way.
 [[nodiscard]] bool PresenterGenerates();
 // Present thread (PresenterGenerates): `backbuffer` is the frame finished at the swapchain's size, its UI included
 // (general layout), `region` where the game image is in it. Records into `command` the frames between the last frame
 // given and this one, into `outputs` (general layout, storage; in order), and returns how many to show before this
 // frame: none for a frame without inputs (a menu, a movie), or the first one after such frames (no frame to start from).
-[[nodiscard]] uint32_t Generate(vk::CommandBuffer command, const FrameInputs* inputs, const UpscaleImage& backbuffer,
-                                vk::Rect2D region, std::span<const UpscaleImage> outputs);
+[[nodiscard]] uint32_t Generate(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs,
+                                const UpscaleImage& backbuffer, vk::Rect2D region, std::span<const UpscaleImage> outputs);
 // Present thread: the frames the last rendered frame was shown as (1 + the generated ones), for PresentedFrames.
 void NotePresented(uint32_t frames);
 

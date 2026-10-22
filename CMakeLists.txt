@@ -425,6 +425,12 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
 	"${KYTY_SOURCE_DIR}/local/frame-gen-hudless.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen-hudless.cpp"
+	"${KYTY_SOURCE_DIR}/local/screenshot.h"
+	"${KYTY_SOURCE_DIR}/local/screenshot.cpp"
+	"${KYTY_SOURCE_DIR}/local/anti-lag.h"
+	"${KYTY_SOURCE_DIR}/local/anti-lag.cpp"
+	"${KYTY_SOURCE_DIR}/local/fsr-native.h"
+	"${KYTY_SOURCE_DIR}/local/fsr-native.cpp"
 	"${KYTY_SOURCE_DIR}/local/debug-snapshot.h"
 	"${KYTY_SOURCE_DIR}/local/debug-snapshot.cpp"
 	"${KYTY_SOURCE_DIR}/local/perf-overlay.h"
@@ -441,6 +447,11 @@ if (KYTY_CLANG_CL)
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak libzstd_static)
+# Linux: AMD FidelityFX FSR 3 built from source (3rdparty/fidelityfx) for KYTY_UPSCALER=fsr
+# (src/local/fsr-native.h); Windows loads AMD's runtime instead (frame-gen.cpp).
+if (LINUX)
+	list(APPEND kyty_emulator_link_libraries kyty_fidelityfx)
+endif()
 
 # Linux system libraries required by the static FFmpeg archive.
 if(LINUX)

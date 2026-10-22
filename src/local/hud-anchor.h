@@ -34,6 +34,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -241,10 +242,25 @@ inline void NoteCanvas(const HW::Context& ctx, const HW::VertexShaderInfo& vs) {
 		FrameGen::NoteUiCanvas(target.base.addr);
 }
 
+// The vertices of each primitive of a draw (`strip`: each vertex with the two before it), 0 when they are not looked at.
+inline uint32_t PrimitiveCorners(Prospero::PrimitiveType primitive, bool& strip) {
+	using Prospero::PrimitiveType;
+	strip = primitive == PrimitiveType::kTriStrip;
+	switch (primitive) {
+		case PrimitiveType::kTriList:
+		case PrimitiveType::kTriStrip:
+		case PrimitiveType::kRectList:
+		case PrimitiveType::kRectListLegacy: return 3;
+		case PrimitiveType::kQuadListLegacy: return 4;
+		default: return 0;
+	}
+}
+
 // The areas the draw's vertices lie in (a bit each, Outside for one in none), from its vertices in guest memory; 0 when
 // it is no interface draw into the canvas in a frame showing the 3D, or its vertices are not readable.
-inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs, uint32_t first, uint32_t count) {
-	if (count != 0 && FrameGen::UsesFsr()) NoteCanvas(ctx, vs);
+inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs, uint32_t first, uint32_t count,
+                         Prospero::PrimitiveType primitive) {
+	if (count != 0 && FrameGen::FsrMarksHud()) NoteCanvas(ctx, vs);
 	if (::Loader::DemonsSoulsRenderSize::WideAspect() <= 0.0 || count == 0) return 0;
 	const auto& target = ctx.GetRenderTarget(0);
 	const auto  width  = CanvasWidthOf(ctx);
@@ -287,6 +303,29 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 	uint32_t areas = 0;
 	bool     icon  = true;
 	float    min_x = 2.0f, max_x = -2.0f;
+	// A primitive over an area's edge: a corner in an area and another on the canvas outside them, or in an area held
+	// to another side. The HUD's own (glyphs, frames, icons) each lie in one area; a menu's (the toolbelt's backdrop
+	// at 43:18 reaches into the picked-up items' and the health's areas, issue #106) are cut at those edges by drawing
+	// each area's part apart, its pieces moved to different sides: such a draw is left as it is, as menus are.
+	bool       strip   = false;
+	const auto corners = PrimitiveCorners(primitive, strip);
+	uint32_t   prim_areas = 0, prim_corner = 0;
+	bool       prim_out = false, straddles = false;
+	// (Strips: the last two corners' area bits and whether each was on the canvas outside the areas.)
+	std::array<std::pair<uint32_t, bool>, 2> last {};
+	const auto over_edge = [](uint32_t in_areas, bool out) {
+		if (in_areas == 0) return false;
+		if (out) return true;
+		float side = 0.0f;
+		bool  any  = false;
+		for (uint32_t a = 0; a < Areas.size(); ++a) {
+			if ((in_areas & (1u << a)) == 0) continue;
+			if (any && Areas[a].side != side) return true;
+			side = Areas[a].side;
+			any  = true;
+		}
+		return false;
+	};
 	for (uint32_t i = 0; i < count; ++i) {
 		float xy[2] {};
 		std::memcpy(xy, reinterpret_cast<const void*>(base + static_cast<uint64_t>(first + i) * stride), sizeof(xy));
@@ -309,6 +348,24 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 			}
 		}
 		areas |= bit;
+		if (corners != 0 && !straddles) {
+			const uint32_t in_area = bit & (Outside - 1u);
+			const bool     out     = bit == Outside && std::fabs(xy[0]) <= 1.0f && std::fabs(xy[1]) <= 1.0f;
+			if (strip) {
+				straddles = i >= 2 && over_edge(in_area | last[0].first | last[1].first, out || last[0].second || last[1].second);
+				last[0]   = last[1];
+				last[1]   = {in_area, out};
+			} else {
+				prim_areas |= in_area;
+				prim_out = prim_out || out;
+				if (++prim_corner == corners) {
+					straddles   = over_edge(prim_areas, prim_out);
+					prim_areas  = 0;
+					prim_out    = false;
+					prim_corner = 0;
+				}
+			}
+		}
 	}
 	// The HUD is what the frame draws from its round icon on: the markers over the world (enemies' health bars and the
 	// damage dealt) come before it, at their targets, often inside the HUD's areas (a bar above an enemy in the top left
@@ -318,7 +375,17 @@ inline uint32_t Classify(const HW::Context& ctx, const HW::VertexShaderInfo& vs,
 	// The lock-on reticle, drawn after the icon: a marker over the world as the ones before it (below).
 	if (state.icon_frame == frame && clip && hash == ClipShaders[1] && count == 4 && areas == Outside && IsReticle(vs, first))
 		return Marker;
-	if (state.icon_frame == frame) return areas;
+	if (state.icon_frame == frame) {
+		static const bool log = std::getenv("KYTY_HUD_LOG") != nullptr;
+		static uint64_t logged_frame = 0;
+		if (log && straddles && logged_frame != frame) {
+			logged_frame = frame;
+			std::printf("HUD anchor: frame %llu draw of %u vertices (%s) over an area's edge (areas %#x, x %.2f to %.2f): "
+			            "drawn as it is\n",
+			            static_cast<unsigned long long>(frame), count, clip ? "clip" : "pixels", areas, min_x, max_x);
+		}
+		return straddles ? 0u : areas;
+	}
 	// The game places those markers with its own 16:9 projection of their targets: aspect / (16/9) times as far from the
 	// screen's centre as the wider 3D shows the targets (the lock-on and an enemy's health bar beside an enemy off the
 	// centre, the user 10-19). A draw before the icon in a frame after one with the HUD is drawn as an area held to the

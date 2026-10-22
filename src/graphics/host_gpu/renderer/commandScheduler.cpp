@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "anti-lag.h"
 #include "async-upload.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -648,7 +649,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 	VkResult result;
 	{
 		Common::LockGuard lock(*submit.queue_mutex);
-		result = dispatch.vkQueueSubmit(submit.queue, 1, &info, VK_NULL_HANDLE);
+		result = Libs::Graphics::AntiLag::QueueSubmit(submit.queue, info, dispatch.vkQueueSubmit, dispatch.vkQueueSubmit2);
 	}
 	if (result != VK_SUCCESS) {
 		if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
@@ -794,7 +795,9 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		                        submit.num_wait_semaphores);
 #endif
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = static_cast<vk::Result>(Libs::Graphics::AntiLag::QueueSubmit(
+		    static_cast<VkQueue>(graphics.queue), *reinterpret_cast<const VkSubmitInfo*>(&submit_info),
+		    VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit, VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit2));
 		m_driver_tick.store(tick, std::memory_order_release);
 	}
 

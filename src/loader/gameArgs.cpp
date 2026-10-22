@@ -1,5 +1,6 @@
 #include "loader/gameArgs.h"
 
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "loader/demonsSoulsSuperResolution.h"
@@ -21,6 +22,8 @@ namespace {
 // between entries), whose names replace the defaults'. The default: no XPR index-buffer culling, a GPU pass that culls
 // every object's triangles (~2800 compute dispatches a frame at Boletaria 1-1) before drawing them; the PC GPU draws
 // them all instead, the image unchanged (Boletaria 1-1 standing 34.30 -> 36.48 fps; doIndexBufferCulling=true: back).
+// Above a 60 Hz vblank also gameMinDeltaTime=0.004 (as run_ds.sh gives it): the game steps by at least a frame of its
+// target rate each frame, so every frame past 60 fps played it that much faster (whatever started the emulator).
 const std::string& ExtraLines() {
 	static const std::string lines = [] {
 		std::vector<std::pair<std::string, std::string>> entries; // (name, "name=value")
@@ -41,7 +44,10 @@ const std::string& ExtraLines() {
 		};
 		const char* value = std::getenv("KYTY_GAME_CONVARS"); // (0: none, not even the defaults)
 		if (value != nullptr && std::string_view(value) == "0") return std::string();
-		if (Libs::Graphics::DemonsSouls::IsSupportedGame()) add("doIndexBufferCulling=false");
+		if (Libs::Graphics::DemonsSouls::IsSupportedGame()) {
+			add("doIndexBufferCulling=false");
+			if (Config::GetVblankFrequency() > 60) add("gameMinDeltaTime=0.004");
+		}
 		if (value != nullptr) add(value);
 		std::string out;
 		for (const auto& [name, entry]: entries) out += "+" + entry + "\n";

@@ -170,8 +170,12 @@ if ($ExportHints) {
 	foreach ($file in $recordings) { $arguments += @('--recorded', $file.FullName) }
 	& $Exe @arguments
 	if ($LASTEXITCODE) { throw 'making the hints failed (kyty_shader_precompile --make-hints)' }
-	Write-Host "hints: $out ($([math]::Ceiling((Get-Item $out).Length / 1KB)) KiB, no game code in it): attach it to an issue"
-	Start-Process explorer.exe "/select,`"$out`""
+	# Zipped as well: GitHub takes a .zip as an attachment, not a .hints file.
+	$zip = "$out.zip"
+	Remove-Item -LiteralPath $zip -ErrorAction SilentlyContinue
+	Compress-Archive -LiteralPath $out -DestinationPath $zip
+	Write-Host "hints: $zip ($([math]::Ceiling((Get-Item $zip).Length / 1KB)) KiB, no game code in it): attach it to a GitHub issue"
+	Start-Process explorer.exe "/select,`"$zip`""
 	exit 0
 }
 $recordedLost = $false
@@ -405,6 +409,11 @@ if (!$Quick) {
 # The shards share the pipelines they hold (PipelineBinaryWriter::Claimed): one that the seeds of several
 # shards make (a third of them) is compiled once.
 $env:KYTY_PRECOMPILE_CLAIMS = Join-Path $nvidiaCaches 'claims'
+# Pipelines the graphics driver never finished compiling (a shard's hang guard: exit 4, issue #126), listed here: every
+# shard leaves them out.
+$stuckList = "$logs\stuck-pipelines.txt"
+$env:KYTY_PRECOMPILE_STUCK = $stuckList
+$restarted = 0
 $running = @{}
 $finished = 0
 $split = 0
@@ -455,6 +464,19 @@ while ($first.Count -or $second.Count -or $running.Count) {
 			$queue.Enqueue(@($seedFile, "$i/$(2 * $n)"))
 			$queue.Enqueue(@($seedFile, "$($i + $n)/$(2 * $n)"))
 			$split++
+		} elseif ($process.ExitCode -eq 4) {
+			# A pipeline the driver never finished compiling (named in the shard's log and in stuck-pipelines.txt): the
+			# shard starts again without it, what it made kept (its .part file, merged like the shards').
+			$restarted++
+			if ($restarted -gt 100) { throw "more than 100 shards stopped at pipelines the driver never finished; logs: $logName" }
+			foreach ($stream in 'out', 'err') {
+				Move-Item -LiteralPath "$logs\$name.$stream.log" "$logs\$name.stuck$restarted.$stream.log" -ErrorAction SilentlyContinue
+			}
+			$queue = $second
+			if ($seedFile -eq $Recorded) { $queue = $first }
+			$queue.Enqueue(@($seedFile, $shard))
+			Write-Host ("  {0:hh\:mm\:ss} {1}: the graphics driver never finished compiling a pipeline; started again without it" -f
+				((Get-Date) - $begin), $name)
 		} elseif ($process.ExitCode -ne 0) {
 			throw "$name failed; logs: $logName"
 		} else {
@@ -468,6 +490,7 @@ while ($first.Count -or $second.Count -or $running.Count) {
 	}
 }
 $env:KYTY_PRECOMPILE_CLAIMS = $null
+$env:KYTY_PRECOMPILE_STUCK = $null
 # (-Quick: what the store held of the other shaders stays. Recorded play that could not be gathered: the pipelines an
 # earlier run made for it stay too - pruned to the seeds alone, the game compiled them all again while playing.)
 # (--stamp: the store's translation features, those this run used: ShaderRecompiler TranslatorFeatures.)
@@ -479,6 +502,12 @@ $cache = Get-ChildItem "$PSScriptRoot\_PipelineCache\static\$gameId.bin", "$PSSc
 	"$PSScriptRoot\_PipelineCache\static\$gameId.blobs" -ErrorAction SilentlyContinue |
 	Sort-Object LastWriteTime | Select-Object -Last 1
 Write-Host ("done in {0:hh\:mm\:ss}: {1} ({2:N0} MB; {3} shards split)" -f ((Get-Date) - $begin), $cache.FullName, ($cache.Length / 1MB), $split)
+if (Test-Path -LiteralPath $stuckList) {
+	$stuckCount = @(Get-Content -LiteralPath $stuckList).Count
+	Write-Host ("$stuckCount pipeline(s) left out: the graphics driver never finished compiling them " +
+		"($logName\stuck-pipelines.txt). The game compiles them when it first needs them and may stop there the same way: " +
+		"please report it on GitHub with that file.")
+}
 } finally {
 	# A failed shard ends the run: the others are stopped too.
 	if ($running) { foreach ($entry in $running.Values) { if (!$entry[2].HasExited) { $entry[2].Kill(); $entry[2].WaitForExit() } } }

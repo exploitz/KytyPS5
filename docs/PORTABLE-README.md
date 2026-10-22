@@ -84,17 +84,26 @@ folder (usually named `PPSA01341-app0`).
 
 ## Starting the game
 
-**Double-click `launcher.cmd`** for a small settings window: the game folder, the resolution with the
-aspect ratio, render height, upscaler and game output beside it, fullscreen (optionally keeping the aspect ratio with
-black bars), the console language and red-zone protection,
-with buttons to play, to precompile the shaders (optionally on the efficiency cores only, so the PC
-stays responsive), and to open the logs folder. It remembers the settings (`launcher-settings.json`).
+**Double-click `KytyLauncher.exe`** (or `launcher.cmd`) for the settings window, in English or Chinese. Its
+pages: **Play** (the game folder or `.zar`; checks of the game, graphics card, RAM, precompiled shaders and
+DLSS/FSR; the Play button), **Display** (resolution, aspect ratio, fullscreen, HDR, up to 120 fps, VSync, low
+latency), **Graphics** (upscaler, render height, game output, graphics preset, frame generation), **Game** (console
+language, cheats), **Shaders** (precompile, optionally on the efficiency cores only so the PC stays responsive;
+export shader hints), **Advanced** (performance overlay, red-zone protection, safe GPU mode, extra command-line
+options, the launcher's language, the logs folder) and **Experimental** (options still being tried out, each with
+the issue that collects how it goes: a 30 fps lock, direct presentation for VRR displays, keep memory resident,
+AMD Anti-Lag). It remembers the settings (`launcher-settings.json`) and needs nothing installed (.NET
+Framework 4.7.2, part of Windows 10 and 11). Windows may ask before its first start ("More info", "Run anyway"):
+it is not signed. The earlier PowerShell window (`launcher.ps1`) still works.
 "Up to 120 fps" (off by default) lets the game render up to 120 frames a second instead of the
 console's 60 where the PC is fast enough: play keeps its speed, and movies, menus and loading screens
 stay at 60.
 "VSync" (off by default) waits for the display's refresh, so the picture does not tear; displays with
 adaptive sync (G-SYNC, FreeSync) keep it. "HDR" (off by default) outputs HDR10 when "Use HDR" is on for the
 display in Windows' display settings (the game is told the TV takes HDR); otherwise the picture stays SDR.
+"Low latency" (off by default) keeps one finished frame waiting for the screen instead of about two, so what you
+press shows sooner: at 60 Hz about 15-23 ms from the game's frame to the screen instead of about 30. A frame that
+comes late is then no longer covered by a waiting one, so the frame pacing is a little less even.
 "Render height" (1440 by default, as on the PS5) is the height the game renders its 3D at before it
 upscales it to its 4K picture; lower heights (1296, 1152, 1080, 900) are faster where the graphics card
 limits the frame rate (a laptop RTX 3080 at Boletaria's start: 20.7 fps at 1440, 24.8 at 1080) and
@@ -132,8 +141,12 @@ width, as without DLSS.
 a 1080p TV: its post-processing and HUD at 1920x1080 instead of 3840x2160 scaled down to the window afterwards,
 and its 3D at most 1080 high (a higher render height is lowered to 1080). Less work for the graphics card: at
 Boletaria's start on an RTX 5090, 69.8 fps at 4K, 78.3 at 1080p. It suits 1080p screens; on larger ones the
-picture is softer than the 4K output's. DLSS makes the 4K output, so with "DLSS (PS5 Pro path)" this row stays
-at 4K.
+picture is softer than the 4K output's. With "DLSS (PS5 Pro path)" too, the game's PS5 Pro mode makes a
+1920x1080 output instead of its 4K one: DLSS turns the 3D at the render height (720 = Quality, 900, 1080 = DLAA)
+into the 1080p picture, and the game finishes it at 1080p, HUD included. For 1080p screens and graphics cards
+that find DLSS's 4K output too heavy (RTX 20/30): the game's own 1080p mode has no upscaler (its 3D, anti-aliasing
+and effects at the render height, stretched at the end). On an RTX 5090 at Boletaria's start (its processor the
+limit there): DLSS from 720 to 1080p 75.2 fps, DLSS from 1080 to 4K 68.8, the game's TAA at 1080p 76.8.
 "Frame generation" (DLSS, 2x to 6x; NVIDIA RTX 40 or newer, 3x and up RTX 50) uses NVIDIA's Streamline
 runtime, which this package does not include: download the Streamline SDK (a release zip from
 https://github.com/NVIDIA-RTX/Streamline/releases), unpack it and choose its folder with the launcher's
@@ -192,17 +205,24 @@ shortcut):
 | `-Width 1920 -Height 1080` | The window size (default 2560×1440, shrunk when the screen is smaller) |
 | `-Game <folder>` | The game folder (or a `.zar` archive of it) |
 | `-Language 11` | The console language, as the PS5 numbers them (0 Japanese, 1 English (US), 11 Chinese (Simplified), ...; the launcher lists them) |
-| `-RenderHeight 1080` | The height the game renders its 3D at (720–1440, default 1440 as on the PS5): lower is faster on a slow graphics card and less sharp |
-| `-HdOutput` | The game's own 1080p output (the launcher's "Game output: 1080p"): post-processing and HUD at 1920×1080, the 3D at most 1080 high; not with `-Upscaler dlss` |
+| `-RenderHeight 1080` | The height the game renders its 3D at (720–2160): lower is faster on a slow graphics card and less sharp. Without it the height follows the window, at most 1440 as on the PS5 (1080 on a 1080p screen) |
+| `-HdOutput` | The game's own 1080p output (the launcher's "Game output: 1080p"): post-processing and HUD at 1920×1080, the 3D at most 1080 high; with `-Upscaler dlss`, DLSS makes the 1080p picture from it |
 | `-Aspect 21:9` | The 3D rendered wider (`21:9` or `32:9`) for ultrawide displays; the HUD keeps its shape at the sides; in-game menus, movies and loading screens are stretched to the width (with `-AspectFit` too: movies, the title and loading screens keep their 16:9, with black bars at the sides) |
 | `-Quality low` | How much the game draws: `low` or `lowest` (shorter shadows, simpler distant detail), faster where the processor limits the frame rate |
 | `-TextureReduce 2` | Large textures without their largest levels: `1` half the size per side (the default with less than 12 GB of video memory), `2` a quarter, `0` whole |
 | `-Fps120` | The game's frame rate up to 120 fps instead of 60 (the launcher's "Up to 120 fps") |
+| `-Set KYTY_FLIP_RATE=1` | The game locked to a steady 30 fps, at the same game speed: half the work, even frame times; movies and menus stay at 60 (the launcher's Experimental "Lock to 30 fps") |
 | `-PresentMode Fifo` | VSync on (the launcher's "VSync") |
+| `-LowLatency` | Less input lag: one frame waiting for the screen instead of about two (the launcher's "Low latency") |
 | `-Hdr` | HDR10 output when Windows' "Use HDR" is on for the display |
 | `-Upscaler dlss` | DLSS super resolution through the game's PS5 Pro path (NVIDIA RTX, needs Streamline: see "Upscaler" above) |
 | `-FrameGen 1` | DLSS frame generation, the number of generated frames per rendered one (`1` = 2x, up to `5`; RTX 40 or newer, needs Streamline) |
 | `-Set KEY=VALUE` | An emulator switch, e.g. `-Set KYTY_SHADER_PREFETCH=0` (several: `-Set A=1,B=2`); the issues name the ones worth trying |
+
+The launcher has a box for these too (Advanced, "Command-line options"), written as after `run.cmd`: its `-Set`
+pairs join the launcher's own (one of the same name replaces the launcher's), and another option replaces the
+launcher's of the same name, e.g. `-RenderHeight 900` or `-Set KYTY_DLSS_PRESET=E`. If the game no longer starts,
+clear the box.
 
 ## Game language (Chinese, Japanese, Korean and others)
 
@@ -267,6 +287,9 @@ There are two levels of preparation, both specific to the graphics card and driv
      overnight is a good idea. Once "ready to play" shows (about halfway), what play needs is in place
      and the game can be started; the rest follows.
    - Closing the window stops it; running it again continues where it stopped.
+   - If the graphics driver never finishes compiling a pipeline (reported on an AMD card), the precompile leaves
+     that pipeline out after 5 minutes and carries on; at the end it lists them in the logs folder
+     (`stuck-pipelines.txt`). Please update the graphics driver, and if it happens again, report that file on GitHub.
    - Coming from an older package with a precompiled `_PipelineCache\static\<title>.bin`: the precompile
      turns it into the store in a few minutes; the `.bin` is then unused and can be deleted (about 4 GB).
    - It compiles the shaders as the game uses them in play too: the package carries what was recorded
@@ -276,8 +299,8 @@ There are two levels of preparation, both specific to the graphics card and driv
      of the time); `precompile.cmd -Full` compiles them too.
    - Places and effects the test PC never recorded (bosses' deaths, for one) still compile when they first
      appear. The launcher's "Export shader hints" button (or `precompile.cmd -ExportHints`) writes what your
-     own play recorded, without the game's shader code, to `my-hints-<title>_<version>.hints` (a few hundred
-     KB, nothing is compiled) and shows it in Explorer: attached to an issue, it goes into the hints of the
+     own play recorded, without the game's shader code, to `my-hints-<title>_<version>.hints.zip` (a few hundred
+     KB, nothing is compiled) and shows it in Explorer: attached to a GitHub issue, it goes into the hints of the
      next packages.
    - **After a graphics driver update or a new graphics card it has to be done again**; the launcher
      asks again. It also asks after an update of the emulator that precompiles more: running it again
@@ -364,12 +387,16 @@ hurts.
 - On some PCs the graphics card hangs ("device lost", the screen goes black and the driver restarts, or a
   VIDEO_TDR_FAILURE blue screen), in a laptop RTX 3080's case within minutes at Boletaria: turn on "Safe GPU
   mode" in the launcher (see above). The frame rate is then about 37% lower.
-- Sound: 3D sound has no direction, and there is no reverb.
+- Sound: 3D sound has no direction, and there is no reverb. On a busy PC it may crackle: the sound buffer
+  (20 ms) grows by itself after each dropout; to start with a bigger one: `run.cmd -Set KYTY_AUDIO_BUFFER_MS=60`
+  (up to 200).
 - It uses a lot of memory and video memory: on PCs with too little it may just exit.
 - On some PCs whose RAM runs full (mostly 16 GB with a browser open), Windows stops with a
   MEMORY_MANAGEMENT blue screen after 10 minutes to an hour of play (issue #50, being worked on). Until it is
   fixed: close other large programs while playing, keep a page file of at least 32 GB, and restart the game
-  after long sessions.
+  after long sessions. An untested option for it is on the launcher's Experimental page, "Keep memory resident"
+  (`run.cmd -Set KYTY_RESIDENT_MB=6144,KYTY_WORKING_SET_TRIM=0`; it uses about 1.5 GB more RAM): a note in issue #50
+  on whether it helps is welcome.
 - On some TVs the picture tears or stutters with VSync on. A user's fix on a 60 Hz TV with an NVIDIA
   card (issue #30): in the NVIDIA Control Panel, Manage 3D settings > Program Settings, add
   `kyty_emulator.exe` and set "Vertical sync" to On and "Vulkan/OpenGL present method" to "Prefer native".

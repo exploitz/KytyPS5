@@ -665,8 +665,8 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	}
 	auto target_file = binaries ? StaticBinariesPath() : blobs ? StaticBlobsPath() : StaticCachePath();
 	// Named after the seed file too: a run shards several (precompile-windows.ps1: seeds and recorded).
-	if (shards > 1 || binaries || blobs)
-		target_file += fmt::format(".shard{}of{}-{}", shard, shards, Common::PathToString(args.seeds.stem()));
+	const bool shard_file = shards > 1 || binaries || blobs;
+	if (shard_file) target_file += fmt::format(".shard{}of{}-{}", shard, shards, Common::PathToString(args.seeds.stem()));
 	const auto save = [&] {
 		if (blobs) {
 			auto temporary = target_file;
@@ -763,6 +763,112 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	const auto spirv_hash = [&](const Permutation* permutation) { return spirv_of.find(permutation)->second.hash; };
 	// (Its layouts are shared with other pipelines of the same bindings: the pipeline cache destroys them.)
 	const auto destroy = [&](Pipeline& pipeline) { m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr); };
+	// The hang guard (issue #126: an RX 7800 XT's shards waited for hours on compiles its driver never finished, a thread
+	// of each still busy): the compiles in flight, looked at every 15 s. One running for 2 minutes is named in the log;
+	// one past KYTY_PRECOMPILE_STUCK_SECONDS (default 300; 0: no limit; a boss's death took ~75 s on an AMD GPU) is
+	// stuck: the shard takes no more work, lets its other compiles finish, adds the stuck pipelines' keys to the file
+	// KYTY_PRECOMPILE_STUCK names (the scripts: the run's stuck-pipelines.txt, whose keys every shard leaves out), saves,
+	// keeps its file as .part<k> (merged like the shards') and ends with exit code 4, for the script to start it again.
+	struct InFlight {
+		std::chrono::steady_clock::time_point start;
+		const char*                           kind       = nullptr;
+		uint64_t                              key        = 0;
+		uint64_t                              hash       = 0; // the seeds' (the pixel shader's in pixel_hash)
+		uint64_t                              pixel_hash = 0;
+		size_t                                n          = 0;
+		bool                                  reported   = false;
+	};
+	std::mutex                   in_flight_mutex;
+	std::map<uint64_t, InFlight> in_flight;
+	uint64_t                     in_flight_tokens = 0;
+	std::atomic<bool>            stop_new {false};
+	const uint64_t               stuck_seconds = [] {
+		const char* value = std::getenv("KYTY_PRECOMPILE_STUCK_SECONDS");
+		return value != nullptr && *value != 0 ? std::strtoull(value, nullptr, 10) : uint64_t {300};
+	}();
+	const char*                  stuck_list = std::getenv("KYTY_PRECOMPILE_STUCK");
+	std::unordered_set<uint64_t> stuck_keys;
+	if (stuck_list != nullptr && *stuck_list != 0) {
+		std::ifstream file {std::filesystem::path(stuck_list)};
+		for (std::string line; std::getline(file, line);)
+			if (line.size() >= 16) stuck_keys.insert(std::strtoull(line.substr(0, 16).c_str(), nullptr, 16));
+	}
+	std::atomic<size_t> stuck_left_out {0};
+	const auto          compile_begins = [&](const char* kind, uint64_t key, uint64_t hash, uint64_t pixel_hash, size_t n) {
+		std::lock_guard lock(in_flight_mutex);
+		const auto      token = ++in_flight_tokens;
+		in_flight.emplace(token, InFlight {std::chrono::steady_clock::now(), kind, key, hash, pixel_hash, n});
+		return token;
+	};
+	const auto compile_ends = [&](uint64_t token) {
+		std::lock_guard lock(in_flight_mutex);
+		in_flight.erase(token);
+	};
+	const auto seconds_since = [](std::chrono::steady_clock::time_point start) {
+		return static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count());
+	};
+	// (The checkpoint thread's.) Ends the process when a compile is stuck.
+	const auto guard_compiles = [&] {
+		bool stuck = false;
+		{
+			std::lock_guard lock(in_flight_mutex);
+			for (auto& [token, compile]: in_flight) {
+				const auto seconds = seconds_since(compile.start);
+				if (!compile.reported && seconds >= 120) {
+					compile.reported = true;
+					PipelineCacheLog("Shader seeds: still compiling after {} s: {} {:016x} (seeds {:016x} {:016x}, work item {})",
+					                 seconds, compile.kind, compile.key, compile.hash, compile.pixel_hash, compile.n);
+				}
+				stuck |= stuck_seconds != 0 && seconds >= stuck_seconds;
+			}
+		}
+		if (!stuck) return;
+		stop_new.store(true, std::memory_order_relaxed);
+		PipelineCacheLog("Shader seeds: a compile is past {} s, the driver does not return: no more work items here", stuck_seconds);
+		// Its other compiles finish (or get stuck too: each waits at most the limit).
+		for (bool running = true; running;) {
+			{
+				std::lock_guard lock(in_flight_mutex);
+				running = std::ranges::any_of(in_flight, [&](const auto& entry) {
+					return seconds_since(entry.second.start) < stuck_seconds;
+				});
+			}
+			if (running) std::this_thread::sleep_for(std::chrono::seconds(1));
+		}
+		std::string lines;
+		{
+			std::lock_guard lock(in_flight_mutex);
+			for (const auto& [token, compile]: in_flight) {
+				const auto seconds = seconds_since(compile.start);
+				PipelineCacheLog("Shader seeds: never finished compiling (after {} s): {} {:016x} (seeds {:016x} {:016x}, work "
+				                 "item {})",
+				                 seconds, compile.kind, compile.key, compile.hash, compile.pixel_hash, compile.n);
+				lines += fmt::format("{:016x} {} seeds {:016x} {:016x} work item {} after {} s ({})\n", compile.key,
+				                     compile.kind, compile.hash, compile.pixel_hash, compile.n, seconds, seed_name);
+			}
+		}
+		if (stuck_list != nullptr && *stuck_list != 0) {
+			std::ofstream file(std::filesystem::path(stuck_list), std::ios::app | std::ios::binary);
+			file << lines;
+		}
+		// What it made, kept beside the shards' files under a name of its own: it starts again, empty, as itself.
+		if (save() && shard_file) {
+			std::error_code error;
+			for (uint32_t k = 1; k < 100000; k++) {
+				auto part = target_file;
+				part += fmt::format(".part{}", k);
+				if (std::filesystem::exists(part, error)) continue;
+				std::filesystem::rename(target_file, part, error);
+				PipelineCacheLog("Shader seeds: {} pipelines kept in {}", created.load(), Common::PathToString(part));
+				break;
+			}
+		}
+		std::printf("Shader precompile: stuck (exit 4: start the shard again; KYTY_PRECOMPILE_STUCK lists the pipelines it "
+		            "leaves out)\n");
+		std::fflush(nullptr);
+		std::_Exit(4);
+	};
 	// Saved every ten minutes too: an interrupted precompile loses at most that.
 	std::mutex              checkpoint_mutex;
 	std::condition_variable checkpoint_wake;
@@ -771,16 +877,22 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 	if (create_pipelines && !args.dry_run && (target != nullptr || binaries || blobs)) {
 		checkpoints = std::jthread([&] {
 			std::unique_lock lock(checkpoint_mutex);
-			while (!checkpoint_wake.wait_for(lock, std::chrono::minutes(10), [&] { return pipelines_done; })) {
+			auto             saved_at = std::chrono::steady_clock::now();
+			while (!checkpoint_wake.wait_for(lock, std::chrono::seconds(15), [&] { return pipelines_done; })) {
 				lock.unlock();
-				if (save())
-					PipelineCacheLog("Shader seeds: checkpoint after {} pipelines, {} ms", created.load(), elapsed());
+				guard_compiles();
+				if (std::chrono::steady_clock::now() - saved_at >= std::chrono::minutes(10)) {
+					if (save())
+						PipelineCacheLog("Shader seeds: checkpoint after {} pipelines, {} ms", created.load(), elapsed());
+					saved_at = std::chrono::steady_clock::now();
+				}
 				lock.lock();
 			}
 		});
 	}
 	if (create_pipelines) {
 		parallel(seed_words.size() + recipes.size(), [&](size_t n) {
+			if (stop_new.load(std::memory_order_relaxed)) return;
 			// Once binaries (or blobs) are left out, the rest would be too: for a smaller shard.
 			if (!mine(n) || (writer != nullptr && writer->LeftOut() != 0) ||
 			    (blob_writer != nullptr && blob_writer->LeftOut() != 0))
@@ -802,10 +914,18 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 					if (!here && !args.dry_run) return;
 					const auto start = std::chrono::steady_clock::now();
 					if (here) {
-						Pipeline pipeline;
+						// (One an earlier attempt's driver never finished: left out. None once the shard stops.)
+						if (stuck_keys.contains(key)) {
+							stuck_left_out.fetch_add(1, std::memory_order_relaxed);
+							return;
+						}
+						if (stop_new.load(std::memory_order_relaxed)) return;
+						const auto token = compile_begins(kind, key, input.hash, 0, n);
+						Pipeline   pipeline;
 						CreatePipelineInternal(m_graphics, pipeline, input.compute, permutation.handle.module, driver_cache,
 						                       PipelineBuild::Full, native);
 						destroy(pipeline);
+						compile_ends(token);
 					}
 					created_one(start, words_of(&permutation), input.hash, 0, kind, key, n);
 				};
@@ -854,11 +974,18 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 				if (!here && !args.dry_run) return;
 				const auto start = std::chrono::steady_clock::now();
 				if (here) {
-					Pipeline pipeline;
+					if (stuck_keys.contains(key)) {
+						stuck_left_out.fetch_add(1, std::memory_order_relaxed);
+						return;
+					}
+					if (stop_new.load(std::memory_order_relaxed)) return;
+					const auto token = compile_begins(kind, key, vs.hash, pixel != nullptr ? ps.hash : 0, n);
+					Pipeline   pipeline;
 					CreatePipelineInternal(m_graphics, pipeline, recipe.rendering, recipe.vertex_input, vs.vertex,
 					                       vertex_permutation.handle, pixel ? &ps.pixel : nullptr,
 					                       pixel ? pixel->handle : ShaderProgram {}, recipe.state, driver_cache, native);
 					destroy(pipeline);
+					compile_ends(token);
 				}
 				created_one(start, words_of(&vertex_permutation) + words_of(pixel), vs.hash, pixel != nullptr ? ps.hash : 0,
 				            kind, key, n);
@@ -940,6 +1067,10 @@ bool PipelineCache::WarmSeeds(const PrecompileOptions& args, size_t& left_out) {
 		PipelineCacheLog("Shader seeds: stopped after {} captured pipelines (KYTY_PRECOMPILE_SHARD_CAP), {} work items left "
 		                 "to a smaller shard",
 		                 writer->Captured(), stopped);
+	if (const auto stuck_out = stuck_left_out.load(); stuck_out != 0)
+		PipelineCacheLog("Shader seeds: {} pipelines left out: the driver never finished them in an earlier attempt "
+		                 "(KYTY_PRECOMPILE_STUCK)",
+		                 stuck_out);
 	left_out = (writer != nullptr ? writer->LeftOut() : 0) + (blob_writer != nullptr ? blob_writer->LeftOut() : 0) +
 	           capped.load();
 	m_graphics.pipeline_binary_writer = nullptr;

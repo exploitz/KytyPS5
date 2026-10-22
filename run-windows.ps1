@@ -27,6 +27,9 @@
 #   .\run-windows.ps1 -Fps120                the game's frame rate up to 120 fps instead of 60 (a 120 Hz
 #                                            virtual vblank; movies, menus and loading screens keep 60)
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
+#   .\run-windows.ps1 -LowLatency            one frame queued instead of about two: what you press shows sooner (at
+#                                            60 Hz 15-23 ms from the game's frame to the screen instead of ~30); a late
+#                                            frame is no longer covered by a queued one (KYTY_LOW_LATENCY)
 #   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
 #   .\run-windows.ps1 -HdOutput              Demon's Souls' own 1080p mode (a PS5's on a 1080p TV): its post-processing
@@ -69,6 +72,7 @@ param(
 	[string]$PresentMode = '',
 	[int]$Vblank = 0,
 	[switch]$Fps120,
+	[switch]$LowLatency,
 	[int]$RenderHeight = 0,
 	[switch]$HdOutput,
 	[string]$Aspect = '',
@@ -254,8 +258,9 @@ if (!$environment.Contains('KYTY_RENDER_CPUS')) { $environment['KYTY_RENDER_CPUS
 # -RenderHeight: the height Demon's Souls' performance mode renders its 3D at (src/loader/demonsSoulsRenderSize.h);
 # the game upscales it to its 3840x2160 output as it does 1440 (a laptop's RTX 3080 at Boletaria 1-1: standing
 # 20.7 -> 24.5 fps at 1080, walking 18.7 -> 22.2).
-# With -Upscaler the height is that of the PS5 Pro's display mode (2688x1512 unless given), so 1440 is passed too.
-if ($RenderHeight -gt 0 -and ($RenderHeight -ne 1440 -or $Upscaler)) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
+# Without it the height follows the window: its own height, 720 to the game's 1440 (with -Upscaler the window's / 1.5,
+# at least 1080). A height given is passed as given, 1440 too, so the window's size does not change a choice.
+if ($RenderHeight -gt 0) { $environment['KYTY_RENDER_HEIGHT'] = "$RenderHeight" }
 # -HdOutput: the game's 1080p output (src/loader/demonsSoulsHdOutput.h). A 1440 render height (the default) becomes 1080.
 if ($HdOutput) { $environment['KYTY_HD_OUTPUT'] = '1' }
 # -Aspect 21:9 (or 32:9, w:h): the 3D rendered at that aspect, its width at the render height (3416x1440), the game's
@@ -296,6 +301,8 @@ if ($Precompile) {
 }
 if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
+# -LowLatency: src/graphics/presentation/videoOut.cpp's FlipQueue (fc1e9cf4).
+if ($LowLatency) { $environment['KYTY_LOW_LATENCY'] = '1' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
 # -Upscaler dlss: src/loader/demonsSoulsSuperResolution.h.
 if ($Upscaler) { $environment['KYTY_UPSCALER'] = $Upscaler }

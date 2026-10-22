@@ -1,5 +1,6 @@
 #include "frame-gen.h"
 #include "frame-gen-hudless.h"
+#include "fsr-native.h"
 
 #include "common/logging/log.h"
 #include "local-platform.h"
@@ -63,6 +64,16 @@
 #include <string>
 #endif
 
+#if defined(KYTY_FRAMEGEN_FSR) || defined(KYTY_FRAMEGEN_NGX)
+// FSR's HUD-less image (RecordHudless): the Windows FSR backend's, and FSR 3 built in on Linux (fsr-native.h).
+#define KYTY_FRAMEGEN_FSR_HUD 1
+#include "gpu_blit_shaders/fsr_hud_mask_spv.h"
+#include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+
+#include <cinttypes>
+#include <cstdio>
+#endif
+
 #ifdef KYTY_FRAMEGEN_NGX
 // NVIDIA DLSS on Linux, where Streamline does not exist: NGX through the bridge libkyty_dlss.so (tools/local/dlss-bridge),
 // loaded at run time, the only part that uses NVIDIA's SDK.
@@ -94,6 +105,7 @@ struct Sources {
 
 int      g_generate    = 0;     // frames to generate per rendered frame (0 = off)
 bool     g_ready       = false; // Streamline loaded and the feature available
+bool     g_fsr_native  = false; // Linux KYTY_FRAMEGEN_BACKEND=fsr: FSR 3 built in (fsr-native.h), shown by the presenter
 bool     g_upscale     = false; // KYTY_UPSCALER=dlss: DLSS super resolution asked for (Streamline loaded for it)
 bool     g_upscale_ready = false; // ... and available on the device
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
@@ -199,7 +211,7 @@ void Configure(GraphicContext& graphics, VulkanImage& image, vk::ImageView& view
 
 namespace {
 
-#ifdef KYTY_FRAMEGEN_FSR
+#ifdef KYTY_FRAMEGEN_FSR_HUD
 // `source` scaled into `target` (a color image; filtered).
 void BlitInto(vk::CommandBuffer command, Image& source, VulkanImage& target) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command);
@@ -622,6 +634,9 @@ bool FsrEnsureFrameGeneration(vk::Extent2D render) {
 	return true;
 }
 
+#endif
+
+#ifdef KYTY_FRAMEGEN_FSR_HUD
 // The game's interface canvas (NoteUiCanvas: its guest address; the GPU thread's): 3840x2160, or the HD output's
 // 1920x1080 (loader/demonsSoulsHdOutput.h).
 std::atomic<uint64_t> g_ui_canvas {0};
@@ -848,6 +863,9 @@ void ImageBarrier(vk::CommandBuffer command, vk::Image image, vk::ImageLayout fr
 	command.pipelineBarrier2(dependency);
 }
 
+#endif
+
+#ifdef KYTY_FRAMEGEN_FSR
 // The swapchain calls this from its present (allowAsyncWorkloads off: on the game queue): the generated frame.
 ffxReturnCode_t FsrGenerate(ffxDispatchDescFrameGeneration* params, void* context) {
 	if (std::exchange(g_fsr_state.reset, false)) params->reset = true;
@@ -1233,10 +1251,22 @@ void Initialize() {
 	g_generate        = value != nullptr ? std::clamp(std::atoi(value), 0, 5) : 0;
 	const char* upscaler = std::getenv("KYTY_UPSCALER");
 	g_upscale            = upscaler != nullptr && std::string_view(upscaler) == "dlss";
+	// Linux: KYTY_FRAMEGEN_BACKEND=fsr is FSR 3 frame interpolation built in (fsr-native.h, KYTY_FRAMEGEN implied), shown by
+	// the presenter as NGX's DLSS-G frames are; no NVIDIA runtime. DLSS super resolution may still load the bridge.
+	if (FsrNative::InterpolationRequested()) {
+		g_generate   = 1;
+		g_fsr_native = true;
+		std::printf("Frame generation: AMD FSR 3 (2x, built in)\n");
+		std::fflush(stdout);
+	}
 	if (g_generate == 0 && !g_upscale) {
 		return;
 	}
-	if (const char* backend = std::getenv("KYTY_FRAMEGEN_BACKEND"); backend != nullptr && std::string(backend) == "fsr") {
+	if (g_fsr_native && !g_upscale) {
+		return;
+	}
+	if (const char* backend = std::getenv("KYTY_FRAMEGEN_BACKEND");
+	    !g_fsr_native && backend != nullptr && std::string(backend) == "fsr") {
 		// (No Streamline with FSR, so no DLSS super resolution either.)
 		g_upscale = false;
 #ifdef KYTY_FRAMEGEN_FSR
@@ -1285,8 +1315,8 @@ void Initialize() {
 		bool done = false;
 		~Off() {
 			if (!done) {
-				g_generate = 0;
-				g_upscale  = false;
+				if (!g_fsr_native) g_generate = 0;
+				g_upscale = false;
 			}
 		}
 	} off;
@@ -1492,7 +1522,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 				g_upscale_ready = true;
 				std::printf("DLSS super resolution: ready (NVIDIA NGX)\n");
 			}
-			if (g_generate > 0) {
+			if (g_generate > 0 && !g_fsr_native) {
 				const int most = g_dlss->FrameGenMaxCount();
 				if (most < 1) {
 					LOGF("frame generation: NGX offers no DLSS-G on this GPU or driver\n");
@@ -1516,9 +1546,11 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		}
 		std::fflush(stdout);
 	}
+	// (FSR 3 built in: its contexts are made by the present thread with the first frame it generates.)
+	if (g_fsr_native) g_ready = true;
 	if (g_generate > 0 && !g_ready) g_generate = 0; // (no NGX: Requested() and the rest see it off)
 #endif
-	if (g_generate == 0 || g_fsr) {
+	if (g_generate == 0 || g_fsr || g_fsr_native) {
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -1913,10 +1945,10 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	inputs.camera        = camera;
 	inputs.guest_frame   = g_guest_frame;
 	inputs.valid         = true;
-#ifdef KYTY_FRAMEGEN_FSR
+#ifdef KYTY_FRAMEGEN_FSR_HUD
 	// FSR: the interface canvas as it is at the flip (RecordHudless reads its alpha).
 	inputs.ui_valid = false;
-	if (const uint64_t canvas = g_ui_canvas.load(std::memory_order_relaxed); g_fsr && canvas != 0) {
+	if (const uint64_t canvas = g_ui_canvas.load(std::memory_order_relaxed); (g_fsr || g_fsr_native) && canvas != 0) {
 		static uint32_t reports = 0;
 		if (const auto id = cache.FindImageFromRange(canvas, 8, false); id) {
 			auto&              ui   = cache.GetImage(id);
@@ -1946,7 +1978,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 			std::printf("Frame generation: FSR HUD canvas at 0x%" PRIx64 " not in the texture cache\n", canvas);
 			std::fflush(stdout);
 		}
-	} else if (g_fsr && canvas == 0) {
+	} else if ((g_fsr || g_fsr_native) && canvas == 0) {
 		static uint32_t scenes = 0;
 		if (++scenes == 300) {
 			std::printf("Frame generation: no FSR HUD canvas seen in 300 frames with inputs\n");
@@ -2260,6 +2292,10 @@ bool UsesFsr() {
 	return g_fsr;
 }
 
+bool FsrMarksHud() {
+	return g_fsr || g_fsr_native;
+}
+
 uint64_t FsrVideoMemoryReserve() {
 	// (Measured with a 2560x1440 swapchain: the driver's share of the video memory 1.33-1.38 GiB with FSR, 0.55-0.70
 	// without; and the HUD images.) KYTY_FSR_VRAM_RESERVE_MB overrides it.
@@ -2271,7 +2307,7 @@ uint64_t FsrVideoMemoryReserve() {
 }
 
 void NoteUiCanvas(uint64_t address) {
-#ifdef KYTY_FRAMEGEN_FSR
+#ifdef KYTY_FRAMEGEN_FSR_HUD
 	if (g_ui_canvas.exchange(address, std::memory_order_relaxed) != address) {
 		std::printf("Frame generation: FSR HUD from the interface canvas at 0x%" PRIx64 "\n", address);
 		std::fflush(stdout);
@@ -2282,8 +2318,8 @@ void NoteUiCanvas(uint64_t address) {
 }
 
 void RecordHudless(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs, vk::Image backbuffer,
-                   vk::Extent2D extent, vk::Rect2D region) {
-#ifdef KYTY_FRAMEGEN_FSR
+                   vk::Extent2D extent, vk::Rect2D region, vk::Format format) {
+#ifdef KYTY_FRAMEGEN_FSR_HUD
 	auto& h = g_fsr_hud;
 	h.ready = false;
 	// KYTY_FSR_HUD=0: no HUD-less image (FSR interpolates the HUD with the scene); KYTY_FSR_HUD_ALPHA: the canvas alpha
@@ -2300,11 +2336,19 @@ void RecordHudless(GraphicContext& graphics, vk::CommandBuffer command, const Fr
 		const char* value = std::getenv("KYTY_FSR_HUD_INVERT");
 		return value != nullptr && std::atoi(value) != 0;
 	}();
-	if (!enabled || !OwnsSwapchain() || g_fsr_state.fg_context == nullptr || !g_fsr_state.mode_on || inputs == nullptr ||
-	    !inputs->valid || !inputs->ui_valid || extent.width == 0 || extent.height == 0) {
+	// (The Windows backend's swapchain while it generates, in its format; or FSR 3 built in, in the backbuffer's.)
+	bool generating = g_fsr_native && PresenterGenerates() && format != vk::Format::eUndefined;
+#ifdef KYTY_FRAMEGEN_FSR
+	if (!g_fsr_native) {
+		generating = OwnsSwapchain() && g_fsr_state.fg_context != nullptr && g_fsr_state.mode_on;
+		format     = g_fsr_state.format;
+	}
+#endif
+	if (!enabled || !generating || inputs == nullptr || !inputs->valid || !inputs->ui_valid || extent.width == 0 ||
+	    extent.height == 0) {
 		return;
 	}
-	if (!FsrHudSetup(graphics, g_fsr_state.format, extent)) return;
+	if (!FsrHudSetup(graphics, format, extent)) return;
 	h.index     = (h.index + 1u) % static_cast<uint32_t>(h.images.size());
 	auto& image = h.images[h.index];
 	// The backbuffer as the game image's blit left it, copied.
@@ -2391,7 +2435,7 @@ void RecordHudless(GraphicContext& graphics, vk::CommandBuffer command, const Fr
 	}
 	h.ready = true;
 #else
-	(void)graphics, (void)command, (void)inputs, (void)backbuffer, (void)extent, (void)region;
+	(void)graphics, (void)command, (void)inputs, (void)backbuffer, (void)extent, (void)region, (void)format;
 #endif
 }
 
@@ -2530,7 +2574,7 @@ bool SkipsFrame(const FrameInputs* inputs) {
 
 bool PresenterGenerates() {
 #ifdef KYTY_FRAMEGEN_NGX
-	return g_ready && g_dlss != nullptr && g_generate > 0 && !g_fg_failed;
+	return g_ready && g_generate > 0 && !g_fg_failed && (g_dlss != nullptr || g_fsr_native);
 #else
 	return false;
 #endif
@@ -2636,8 +2680,8 @@ void NotePresented(uint32_t frames) {
 	g_presented_frames.store(std::max(frames, 1u), std::memory_order_relaxed);
 }
 
-uint32_t Generate(vk::CommandBuffer command, const FrameInputs* inputs, const UpscaleImage& backbuffer, vk::Rect2D region,
-                  std::span<const UpscaleImage> outputs) {
+uint32_t Generate(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs, const UpscaleImage& backbuffer,
+                  vk::Rect2D region, std::span<const UpscaleImage> outputs) {
 #ifdef KYTY_FRAMEGEN_NGX
 	if (!PresenterGenerates()) return 0;
 	const bool discontinuity = g_fg_discontinuity.exchange(false, std::memory_order_relaxed);
@@ -2645,6 +2689,47 @@ uint32_t Generate(vk::CommandBuffer command, const FrameInputs* inputs, const Up
 		// (Menus, movies, loading: the frame shown as it is; the next one with inputs starts DLSS-G again.)
 		g_fg_history = false;
 		return 0;
+	}
+	if (g_fsr_native) {
+		// FSR 3 built in: one frame between the last one and this, from the same inputs as DLSS-G's.
+		if (outputs.empty()) return 0;
+		const auto image = [](const VulkanImage& source, vk::ImageView view) {
+			return UpscaleImage {source.image, view, vk::ImageLayout::eShaderReadOnlyOptimal, source.format,
+			                     vk::Extent2D {source.extent.width, source.extent.height}, source.usage, 0, 0};
+		};
+		FsrNative::InterpolationInputs fsr;
+		fsr.backbuffer   = backbuffer;
+		fsr.depth        = image(inputs->depth, inputs->depth_view);
+		fsr.motion       = image(inputs->motion, inputs->motion_view);
+		fsr.region       = region;
+		const float width  = static_cast<float>(inputs->render_extent.width);
+		const float height = static_cast<float>(inputs->render_extent.height);
+		// (FSR's documented convention, DLSS-G's here: the projection's offset in pixels, y down.)
+		fsr.jitter_px = {inputs->camera.jitter_ndc[0] * width * 0.5f, -inputs->camera.jitter_ndc[1] * height * 0.5f};
+		if (const auto camera = Decompose(inputs->camera.view_proj); camera.valid) {
+			fsr.near_plane = camera.z_near;
+			fsr.fov_y      = 2.0f * std::atan(1.0f / std::fabs(camera.sy));
+		}
+		// The game's frame time: the time between the frames given here, a long gap (a load, a pause) left out.
+		static auto last  = std::chrono::steady_clock::time_point {};
+		static float frame_ms = 16.7f;
+		const auto now = std::chrono::steady_clock::now();
+		if (last != std::chrono::steady_clock::time_point {}) {
+			const float ms = std::chrono::duration<float, std::milli>(now - last).count();
+			if (ms > 2.0f && ms < 100.0f) frame_ms = ms;
+		}
+		last         = now;
+		fsr.frame_ms = frame_ms;
+		fsr.reset    = !g_fg_history || discontinuity;
+		// (This frame's HUD-less image, RecordHudless: FSR takes the HUD and the menus from the game's frame.)
+		if (auto& h = g_fsr_hud; h.ready) {
+			const auto& hud = h.images[h.index];
+			fsr.hudless     = {hud.image,       h.views[h.index], vk::ImageLayout::eShaderReadOnlyOptimal, hud.format,
+			                   backbuffer.extent, hud.usage,       0,                                      0};
+		}
+		const bool made = FsrNative::Interpolate(graphics, command, fsr, outputs[0]);
+		g_fg_history    = true;
+		return made ? 1u : 0u;
 	}
 	const auto count = static_cast<uint32_t>(std::min<size_t>(outputs.size(), static_cast<size_t>(g_generate)));
 	if (count == 0) return 0;
@@ -2773,6 +2858,7 @@ uint32_t Generate(vk::CommandBuffer command, const FrameInputs* inputs, const Up
 	g_fg_history = true;
 	return reset ? 0u : made;
 #else
+	(void)graphics;
 	(void)command;
 	(void)inputs;
 	(void)backbuffer;

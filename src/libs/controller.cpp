@@ -11,6 +11,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "local/anti-lag.h"
 #include "loader/demonsSoulsWarp.h"
 
 #include <cstdlib>
@@ -1181,6 +1182,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	bool            connected       = false;
 	ControllerState state;
 
+	Graphics::AntiLag::Input(); // (KYTY_LOW_LATENCY on AMD: a new frame's input; the driver may wait here)
 	g_controller->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
@@ -1205,6 +1207,7 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	bool            connected       = false;
 	ControllerState states[64]      = {};
 
+	Graphics::AntiLag::Input(); // (KYTY_LOW_LATENCY on AMD: a new frame's input; the driver may wait here)
 	int ret_num = g_controller->ReadStates(states, num, &connected, &connected_count);
 
 	if (!connected || ret_num == 0) {

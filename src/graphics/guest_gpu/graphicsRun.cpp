@@ -1459,7 +1459,8 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	CheckBuffer();
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h); a draw over several of its
 	// areas goes the normal way, drawn once for each.
-	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), packet[1]));
+	const auto hud =
+	    HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), packet[1], primitive));
 	if (hud.Several()) return 0u;
 	std::optional<HudAnchor::Scope>        anchor;
 	std::optional<HudAnchor::StretchScope> widen;
@@ -1795,7 +1796,8 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		args.instance_count = m_num_instances;
 	}
 	// KYTY_RENDER_ASPECT: the HUD at its sides of the screen, unstretched (hud-anchor.h).
-	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), args.vertex_count));
+	const auto hud = HudAnchor::Split(
+	    HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), args.vertex_count, m_ucfg.GetPrimType()));
 	if (hud.areas == 0 || hud.Single()) {
 		std::optional<HudAnchor::Scope>        anchor;
 		std::optional<HudAnchor::StretchScope> widen;

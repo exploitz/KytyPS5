@@ -32,7 +32,7 @@ Building, running and the developer's workflow are in [docs/CURRENT-PLAYABLE.md]
 ## Building
 
 - [static-precompile](static-precompile/README.md): every shader and pipeline of the game from its files, for the
-  static pipeline cache that `precompile-windows.ps1` makes.
+  static pipeline cache that `precompile-windows.ps1` (Linux: `precompile-linux.sh`) makes.
 - [PGO](PGO.md): the profile the release build uses and how to retrain it (`windows/pgo-train.ps1`).
 
 Keep reusable tools here and one-off scripts out of the repository; git keeps the history of the removed ones.
