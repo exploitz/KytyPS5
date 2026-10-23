@@ -2592,6 +2592,12 @@ static constexpr uint64_t ParallelCompareBytes = uint64_t {2} << 20u;
 static constexpr uint64_t ParallelComparePages = 64; // (a chunk: 256 KiB)
 
 void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
+	if (LiveCounters::g_dispatch_keys_on.load(std::memory_order_relaxed)) {
+		// Local diagnostic: the pages this frame's CP DMA copies rewrite (the table slot page census compares them
+		// with the pages the draws read slots from: gpu-side-tables-plan.md, proof P1).
+		for (auto page = dst_vaddr >> 12u, last = (dst_vaddr + size - 1) >> 12u; page <= last; ++page)
+			LiveCounters::g_dma_pages.insert(page);
+	}
 	// The game's linear copies mostly rewrite what the destination already holds (95% of the bytes in the fixed
 	// scene): only the destination pages whose bytes differ are written, so the others stay clean (no upload of their
 	// bytes to the GPU again). A run of them with a write-protected page (uploaded since it was last written) is marked

@@ -1,0 +1,51 @@
+{
+ "name": "Demon's Souls",
+ "id": "PPSA01341",
+ "version": "01.007.000",
+ "process": "eboot.bin",
+ "credits": [
+  "KytyPS5 Demon's Souls fork (exploitz/KytyPS5): static analysis of the 01.007.000 executable"
+ ],
+ "mods": [
+  {
+   "name": "1080p mode: normal HUD size",
+   "type": "checkbox",
+   "memory": [
+    {
+     "offset": "DDA224",
+     "on": "C5FA100530F97101C3",
+     "off": "CCCCCCCCCCCCCCCCCC"
+    },
+    {
+     "offset": "E60430",
+     "on": "F0",
+     "off": "DC"
+    },
+    {
+     "offset": "E641FA",
+     "on": "26",
+     "off": "12"
+    },
+    {
+     "offset": "1559259",
+     "on": "C7",
+     "off": "B3"
+    }
+   ],
+   "enabled": true
+  },
+  {
+   "name": "1080p mode: 1440p scene (with r_Wants4K=WantsPerf)",
+   "type": "checkbox",
+   "memory": [
+    {
+     "offset": "90A667",
+     "on": "E5EEBE01",
+     "off": "C5EBBE01"
+    }
+   ],
+   "enabled": true
+  }
+ ],
+ "note": "Launcher Output \"1080p quality\": the HUD at its normal size at a 1920x1080 output, and the 1440p scene of the PS5 Performance mode rendered and scaled down to 1080p (with r_Wants4K=WantsPerf). Each patch is applied where its original bytes are found, so other game versions are patched only where the same code exists."
+}

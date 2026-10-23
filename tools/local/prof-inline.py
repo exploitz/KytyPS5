@@ -23,7 +23,13 @@ import struct
 import subprocess
 from pathlib import Path
 
-SYMBOLIZER = r'C:\Program Files\LLVM\bin\llvm-symbolizer.exe'
+import os
+# KYTY_LLVM_BIN names the LLVM bin folder; otherwise the first of these that exists.
+SYMBOLIZER = next((p for p in [os.path.join(os.environ.get('KYTY_LLVM_BIN', ''), 'llvm-symbolizer.exe'),
+                               r'C:\Program Files\LLVM\bin\llvm-symbolizer.exe',
+                               r'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin\llvm-symbolizer.exe',
+                               r'C:\msys64\clang64\bin\llvm-symbolizer.exe'] if os.path.isfile(p)),
+                  'llvm-symbolizer.exe')
 BASE, END = 0x140001000, 0x142000000
 
 

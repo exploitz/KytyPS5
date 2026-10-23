@@ -48,6 +48,55 @@ struct TableUninitialized: std::allocator<T> {
 };
 using TableWords = std::vector<uint32_t, TableUninitialized<uint32_t>>;
 
+// Local diagnostic (KYTY_DISPATCH_KEYS): the guest pages the frame's table draws read their slots from, and how many
+// of them changed since the previous frame (each page hashed once a frame through the backing: ~1 us a page). The
+// slot working set a GPU-side block builder would need mirrored each frame (gpu-side-tables-plan.md, proof P3).
+struct TableSlotPageCensus {
+	std::unordered_map<uint64_t, uint64_t> previous, current; // page -> hash of its bytes
+	uint64_t                               frame = 0;
+	void Note(uint64_t address, uint64_t bytes) {
+		if (bytes == 0) return;
+		for (auto page = address >> 12u, last = (address + bytes - 1) >> 12u; page <= last; ++page) {
+			if (current.contains(page)) continue;
+			alignas(64) static thread_local std::array<uint8_t, 4096> copy;
+			const bool read = Libs::LibKernel::Memory::TryReadBackingToHost(page << 12u, copy.data(), copy.size());
+			current.emplace(page, read ? XXH3_64bits(copy.data(), copy.size()) : 0);
+		}
+	}
+	void Frame(uint64_t now) {
+		if (now == frame) return;
+		frame = now;
+		uint64_t changed = 0, fresh = 0, rewritten = 0, dma = 0, cpu = 0;
+		auto&    dma_pages = LiveCounters::g_dma_pages;
+		for (auto& [page, hash]: current) {
+			const auto before = previous.find(page);
+			if (before == previous.end()) ++fresh;
+			else if (before->second != hash) ++changed;
+			// The page at the frame's end against its first read: rewritten within the frame, by the CP DMA copies the
+			// CPU performed (CopyGuestMemory) or by the game's own CPU writes (what a GPU-ordered DMA cannot fix).
+			alignas(64) static thread_local std::array<uint8_t, 4096> copy;
+			const bool read = Libs::LibKernel::Memory::TryReadBackingToHost(page << 12u, copy.data(), copy.size());
+			const auto now_hash = read ? XXH3_64bits(copy.data(), copy.size()) : 0;
+			const bool by_dma   = dma_pages.contains(page);
+			if (by_dma) ++dma;
+			if (now_hash != hash) {
+				++rewritten;
+				if (!by_dma) ++cpu;
+				hash = now_hash; // (the next frame compares against the frame's last state)
+			}
+		}
+		LiveCounters::Add(LiveCounters::SlotPages, current.size());
+		LiveCounters::Add(LiveCounters::SlotPagesChanged, changed);
+		LiveCounters::Add(LiveCounters::SlotPagesNew, fresh);
+		LiveCounters::Add(LiveCounters::SlotPagesRewritten, rewritten);
+		LiveCounters::Add(LiveCounters::SlotPagesDma, dma);
+		LiveCounters::Add(LiveCounters::SlotPagesCpuRewritten, cpu);
+		dma_pages.clear();
+		previous.swap(current);
+		current.clear();
+	}
+};
+
 // The descriptor set of one choice of images and samplers (the T#/S# words of every stage).
 struct RenderExecutor::TableImageSet {
 	struct Image {
@@ -596,7 +645,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			NativeXprRetireSet(slot->pool, slot->set);
 			pair.last_set     = nullptr;
 			pair.previous_set = nullptr;
-		}
+			}
 		slot = std::move(set);
 		return slot.get();
 	};
@@ -1105,6 +1154,11 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 					return false;
 			}
 			for (auto i = begin; i < end; ++i) reader.Read(table.addresses[i], form.runs[i].count, slots.data() + form.runs[i].first);
+			if (LiveCounters::g_dispatch_keys_on.load(std::memory_order_relaxed)) {
+				static TableSlotPageCensus census;
+				census.Frame(m_context.FrameNumber());
+				for (auto i = begin; i < end; ++i) census.Note(table.addresses[i], uint64_t {form.runs[i].count} * 4u);
+			}
 			begin = end;
 		}
 		const auto first = words.size();
@@ -1656,6 +1710,52 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const auto registration = buffer_cache.RegistrationEpoch();
 	if (!TableBlocks(pair, user_data, blocks, &writes))
 		return LiveCounters::Add(LiveCounters::TableDrawNative), TableResult::Native;
+	if (LiveCounters::g_dispatch_keys_on.load(std::memory_order_relaxed)) {
+		// Local diagnostic (KYTY_DISPATCH_KEYS): did a draw of the previous frame have exactly these inputs (the pair,
+		// its variant, the draw state, both stages' user data, every slot's V# words, the set, the argument addresses
+		// and the index buffer)? The share a replay of last frame's unchanged draws could cover (table_key_same).
+		// A second key leaves out what the game's per-frame ring allocations move (every V# base, the user data, the
+		// argument and index addresses): a draw new by the first key but seen by the second changed only in addresses.
+		static std::unordered_set<uint64_t> previous, current, previous_shape, current_shape;
+		static uint32_t                     keys_frame = 0;
+		const auto                          frame      = static_cast<uint32_t>(m_context.FrameNumber());
+		if (frame != keys_frame) {
+			previous.swap(current);
+			current.clear();
+			previous_shape.swap(current_shape);
+			current_shape.clear();
+			keys_frame = frame;
+		}
+		thread_local std::vector<uint64_t> key, shape;
+		key.clear();
+		shape.clear();
+		for (auto* k: {&key, &shape}) {
+			k->push_back(reinterpret_cast<uint64_t>(&pair));
+			k->push_back(reinterpret_cast<uint64_t>(variant.pipeline));
+			k->push_back(reinterpret_cast<uint64_t>(&draw_state));
+			k->push_back(reinterpret_cast<uint64_t>(set));
+			k->push_back(index_bytes | uint64_t {static_cast<uint32_t>(index_type)} << 48u);
+		}
+		key.push_back(index_base);
+		for (uint32_t st = 0; st < stages; ++st) {
+			for (const auto word: user_data[st]) key.push_back(word);
+			for (const auto& [words4, entry]: table.entries[st]) {
+				key.push_back(uint64_t {words4[0]} | uint64_t {words4[1]} << 32u);
+				key.push_back(uint64_t {words4[2]} | uint64_t {words4[3]} << 32u);
+				shape.push_back(uint64_t {words4[1] & ~0xffffu} | uint64_t {words4[2]} << 32u);
+				shape.push_back(words4[3]);
+			}
+		}
+		for (const auto command: commands) key.push_back(command);
+		shape.push_back(commands.size());
+		const auto hash       = XXH3_64bits(key.data(), key.size() * sizeof(uint64_t));
+		const auto shape_hash = XXH3_64bits(shape.data(), shape.size() * sizeof(uint64_t));
+		current.insert(hash);
+		current_shape.insert(shape_hash);
+		LiveCounters::Add(previous.contains(hash)             ? LiveCounters::TableKeySame
+		                  : previous_shape.contains(shape_hash) ? LiveCounters::TableKeySameShape
+		                                                        : LiveCounters::TableKeyNew);
+	}
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;

@@ -13,7 +13,13 @@ import struct
 import subprocess
 from pathlib import Path
 
-OBJDUMP = r'C:\Program Files\LLVM\bin\llvm-objdump.exe'
+import os
+# KYTY_LLVM_BIN names the LLVM bin folder; otherwise the first of these that exists.
+OBJDUMP = next((p for p in [os.path.join(os.environ.get('KYTY_LLVM_BIN', ''), 'llvm-objdump.exe'),
+                            r'C:\Program Files\LLVM\bin\llvm-objdump.exe',
+                            r'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin\llvm-objdump.exe',
+                            r'C:\msys64\clang64\bin\llvm-objdump.exe'] if os.path.isfile(p)),
+               'llvm-objdump.exe')
 
 
 def load(name):

@@ -2,7 +2,9 @@ param([string]$Label = 'run', [int]$Rounds = 3, [string]$Exe = '', [string[]]$Ex
       [switch]$KeepRunning, [string]$PresentMode = '', [int]$Vblank = 0, [string[]]$Set = @(),
       [string]$Patch = '', [switch]$Fullscreen, [switch]$Hdr, [switch]$ShotOnly, [switch]$NoWalk,
       [int]$StartupSeconds = 100, [int]$StartupAttempts = 3, [switch]$NoPrecompile, [string]$Config = '',
-      [string]$Game = '', [switch]$LoadGame, [int]$Width = 0, [int]$Height = 0)
+      [string]$Game = '', [switch]$LoadGame, [int]$Width = 0, [int]$Height = 0, [switch]$Focus)
+# -Focus: the old start-up loop (the window brought to the front for every capture and key press). Without it the
+# window's image is read in place and the presses go through the emulator's pad command: nothing takes the focus.
 # End to end: fresh baseline save, launch, skip to the game, walk the fixed path once the HUD
 # is really up, measure. Screen states are told apart by pixel statistics.
 $S = $PSScriptRoot
@@ -45,13 +47,23 @@ public class BenchWin {
     i[0].ki.dwFlags = 8u | (up ? 2u : 0u);
     SendInput(1, i, Marshal.SizeOf(typeof(INPUT)));
   }
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   // The client area (the game image) scaled to 640x360, or null: State's positions are in that image, whatever the
-  // display's resolution or the window's place.
-  public static Bitmap Client(IntPtr h) {
+  // display's resolution or the window's place. `front`: read from the screen (the window must be in front); else
+  // PrintWindow with PW_RENDERFULLCONTENT (the window's own composed image, wherever it is: nothing is focused).
+  public static Bitmap Client(IntPtr h, bool front) {
     RECT r; POINT o = new POINT();
     if (!GetClientRect(h, out r) || !ClientToScreen(h, ref o) || r.Right <= 0 || r.Bottom <= 0) return null;
     using (var full = new Bitmap(r.Right, r.Bottom)) {
-      using (var g = Graphics.FromImage(full)) g.CopyFromScreen(o.X, o.Y, 0, 0, full.Size);
+      if (front) { using (var g = Graphics.FromImage(full)) g.CopyFromScreen(o.X, o.Y, 0, 0, full.Size); }
+      else {
+        using (var g = Graphics.FromImage(full)) {
+          IntPtr hdc = g.GetHdc();
+          bool ok = PrintWindow(h, hdc, 3); // PW_CLIENTONLY | PW_RENDERFULLCONTENT
+          g.ReleaseHdc(hdc);
+          if (!ok) return null;
+        }
+      }
       var small = new Bitmap(640, 360);
       using (var g2 = Graphics.FromImage(small)) { g2.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear; g2.DrawImage(full, 0, 0, 640, 360); }
       return small;
@@ -62,7 +74,19 @@ public class BenchWin {
 [BenchWin]::SetProcessDPIAware() | Out-Null
 function Window { Get-Process kyty_emulator -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1 }
 # Press in the emulator window only (never type into another window); Options = Enter, Cross = J.
+# Without -Focus the press is the emulator's own `pad` live command (the pad the game reads, no window focus: an
+# unattended run never takes the desktop from whoever is using it); the live file is polled every 100 ms.
+$script:liveId = [int64](Get-Date).ToFileTime()
 function Press([string]$key, [int]$ms = 150) {
+	if (!$Focus) {
+		$buttons = switch ($key) { 'enter' { '8' } 'j' { '4000' } 'down' { '40' } 's' { '40' } default { '0' } }
+		$script:liveId++
+		$live = "$root\_Build\windows-bench\live-commands.txt" # (bench-windows.py's LIVE_FILE)
+		New-Item -ItemType Directory -Force (Split-Path $live) | Out-Null
+		[System.IO.File]::WriteAllText($live, "id $script:liveId`npad 128 128 128 128 $buttons $($ms / 1000.0)`n")
+		Start-Sleep -Milliseconds ($ms + 150)
+		return
+	}
 	$w = Window; if (!$w -or ![BenchWin]::Focus($w.MainWindowHandle)) { $script:unfocused++; return }
 	$ime = [BenchWin]::ImmGetDefaultIMEWnd($w.MainWindowHandle)
 	if ($ime -ne [IntPtr]::Zero) { [BenchWin]::SendMessage($ime, 0x283, [IntPtr]6, [IntPtr]::Zero) | Out-Null }
@@ -188,8 +212,9 @@ $last = ''
 while (((Get-Date) - $start).TotalSeconds -lt $StartupSeconds) {
 	if (!(Get-Process kyty_emulator -ErrorAction SilentlyContinue)) { $state = 'exited'; break }
 	$w = Window
-	# The capture reads the screen where the window is: it must be in front (as screen.ps1 did).
-	$bmp = if ($w -and [BenchWin]::Focus($w.MainWindowHandle)) { [BenchWin]::Client($w.MainWindowHandle) } else { $null }
+	# -Focus: the capture reads the screen where the window is, so it must be in front (as screen.ps1 did). Otherwise
+	# the window's own image (PrintWindow), in front or not.
+	$bmp = if ($w -and (!$Focus -or [BenchWin]::Focus($w.MainWindowHandle))) { [BenchWin]::Client($w.MainWindowHandle, [bool]$Focus) } else { $null }
 	if (!$bmp) { $script:unfocused++; Start-Sleep -Milliseconds 500; continue }
 	try {
 		$state = State $bmp
