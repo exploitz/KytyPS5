@@ -122,23 +122,27 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
-		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
-		if (m_handle == nullptr) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
-			           static_cast<uint32_t>(GetLastError()));
-			return;
+		m_section_size = SectionSize(m_size);
+		for (uint64_t at = 0; at < m_size; at += m_section_size) {
+			const uint64_t bytes  = std::min(m_section_size, m_size - at);
+			HANDLE         handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+			                                           static_cast<DWORD>(bytes >> 32u),
+			                                           static_cast<DWORD>(bytes & 0xffffffffu), nullptr);
+			if (handle == nullptr) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
+				           static_cast<uint32_t>(GetLastError()));
+				CloseSections();
+				return;
+			}
+			m_handles.push_back(handle);
 		}
-		m_backing_base = static_cast<uint8_t*>(
-		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		m_backing_base = MapAlias();
 		if (m_backing_base == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: writable alias failed: 0x%08" PRIx32 "\n",
 			           static_cast<uint32_t>(GetLastError()));
-			CloseHandle(m_handle);
-			m_handle = nullptr;
+			CloseSections();
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
@@ -187,11 +191,9 @@ public:
 		m_maps.clear();
 		m_coverage.clear();
 		if (m_backing_base != nullptr) {
-			UnmapViewOfFile(m_backing_base);
+			for (uint64_t at = 0; at < m_size; at += m_section_size) UnmapViewOfFile(m_backing_base + at);
 		}
-		if (m_handle != nullptr) {
-			CloseHandle(m_handle);
-		}
+		CloseSections();
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		for (const auto& [_, entry]: m_maps) {
 			EXIT_IF(
@@ -226,7 +228,7 @@ public:
 
 	[[nodiscard]] bool IsAvailable() const {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return m_handle != nullptr && m_backing_base != nullptr;
+		return !m_handles.empty() && m_backing_base != nullptr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		return m_fd >= 0 && m_backing_base != nullptr;
 #else
@@ -509,6 +511,9 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (backing_offset % m_section_size + size > m_section_size) {
+			return MapAcrossSections(vaddr, size, backing_offset, mode, failure_reason, protective);
+		}
 		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			if (mapped != nullptr) {
@@ -1377,15 +1382,106 @@ private:
 		}
 	}
 
+	// The direct memory is one section per KYTY_BACKING_SECTION_MB (default 256; 0: one section of it all, as before).
+	// Windows' large page rebuild (MiRebuildLargePages, a system worker the working-set manager starts) moves pages of
+	// the backing, and for each page it moves checks every view of its section (MiTrimSection) with the section's lock
+	// held; every MapViewOfFile3 and UnmapViewOfFile2 of that section waits for that lock. With one section and the
+	// game's tens of thousands of views, a rebuild after a level load held the game's remaps at ~0.15 ms each for up to
+	// ~18 s (10-20 fps; kernel trace of 10-22). By sections, a moved page checks its section's views alone and holds up
+	// only the remaps there.
+	static uint64_t SectionSize(uint64_t backing_size) {
+		static const uint64_t mib = [] {
+			const char* value = std::getenv("KYTY_BACKING_SECTION_MB");
+			return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {256};
+		}();
+		// (Whole MiB: the alias views below sit side by side at allocation-granularity addresses.)
+		return mib == 0 ? backing_size : std::min(backing_size, std::max<uint64_t>(mib, 16) << 20u);
+	}
+
+	void CloseSections() {
+		for (HANDLE handle: m_handles) CloseHandle(handle);
+		m_handles.clear();
+	}
+
+	// The writable alias of the whole backing: one view per section, side by side in one placeholder.
+	uint8_t* MapAlias() {
+		if (m_handles.size() == 1) {
+			return static_cast<uint8_t*>(MapViewOfFile(m_handles[0], FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		}
+		auto* base = static_cast<uint8_t*>(VirtualAlloc2(GetCurrentProcess(), nullptr, m_size,
+		                                                 MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+		if (base == nullptr) return nullptr;
+		for (uint64_t at = 0; at + m_section_size < m_size; at += m_section_size) {
+			if (VirtualFree(base + at, m_section_size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) return nullptr;
+		}
+		for (uint64_t at = 0; at < m_size; at += m_section_size) {
+			if (MapViewOfFile3(m_handles[at / m_section_size], GetCurrentProcess(), base + at, 0,
+			                   std::min(m_section_size, m_size - at), MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr,
+			                   0) != base + at) {
+				return nullptr; // (fatal: GuestAddressSpace exits)
+			}
+		}
+		return base;
+	}
+
+	// A range whose backing spans sections (a view maps one section): one view per section's piece, each a mapping of
+	// its own (m_maps, m_views), as if the guest had mapped the pieces one by one. The caller's placeholder is cut at
+	// the pieces, and is one placeholder again on failure.
+	bool MapAcrossSections(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode,
+	                       FailureReason* failure_reason, bool protective) {
+		std::vector<MapEntry> pieces;
+		for (uint64_t at = 0; at < size;) {
+			const uint64_t offset = backing_offset + at;
+			const uint64_t bytes  = std::min(size - at, m_section_size - offset % m_section_size);
+			pieces.push_back(MapEntry {vaddr + at, bytes, offset, mode});
+			at += bytes;
+		}
+		size_t mapped = 0;
+		bool   split  = true;
+		for (size_t i = 0; i + 1 < pieces.size() && split; ++i) split = SplitPlaceholder(pieces[i].vaddr, pieces[i].size);
+		for (; split && mapped < pieces.size(); ++mapped) {
+			const auto& piece = pieces[mapped];
+			if (ReplacePlaceholderView(piece.vaddr, piece.size, piece.backing_offset, mode, failure_reason) == nullptr) {
+				break;
+			}
+		}
+		if (!split || mapped < pieces.size()) {
+			for (size_t i = 0; i < mapped; ++i) {
+				EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(pieces[i].vaddr), pieces[i].size));
+			}
+			(void)CoalescePlaceholders(vaddr, size); // (fails when nothing was split)
+			if (!split) SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
+			return false;
+		}
+		if (protective) {
+			for (const auto& piece: pieces) ProtectRemapped(piece.vaddr, piece.size, mode);
+		}
+		{
+			std::lock_guard lock(m_mutex);
+			HoldTimer hold {LiveCounters::BackingHoldMapUs};
+			BackingWriteFence fence(*this);
+			InvalidateMappingLookup();
+			for (const auto& piece: pieces) {
+				EXIT_IF(!MapsEmplace(piece));
+				EXIT_IF(!m_views.emplace(piece.vaddr, piece.size).second);
+			}
+		}
+		LiveCounters::Add(LiveCounters::SectionSplitMaps);
+		SetFailure(failure_reason, FailureReason::None);
+		return true;
+	}
+
 	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
+		const uint64_t section = backing_offset / m_section_size;
+		EXIT_IF(section >= m_handles.size() || backing_offset % m_section_size + size > m_section_size);
 		void* ptr = nullptr;
 		{
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapView, vaddr, size);
-			ptr = MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr), backing_offset, size,
-			                     MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
+			ptr = MapViewOfFile3(m_handles[section], GetCurrentProcess(), reinterpret_cast<void*>(vaddr),
+			                     backing_offset % m_section_size, size, MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
 		}
 		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
 			if (ptr != nullptr) {
@@ -1414,7 +1510,8 @@ private:
 		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
-	HANDLE m_handle = nullptr;
+	std::vector<HANDLE> m_handles;          // the sections, m_section_size bytes each (the last one the rest)
+	uint64_t            m_section_size = 0;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
 

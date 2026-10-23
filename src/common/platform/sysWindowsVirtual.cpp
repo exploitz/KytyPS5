@@ -13,6 +13,8 @@
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
+#include <algorithm>
+
 // IWYU pragma: no_include <basetsd.h>
 // IWYU pragma: no_include <errhandlingapi.h>
 // IWYU pragma: no_include <memoryapi.h>
@@ -328,13 +330,41 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	return current - address == size && SysVirtualFree(address);
 }
 
+// VirtualProtect stays inside one allocation (one view). A guest mapping whose direct memory spans two backing sections
+// is two views (GuestBackingStore::MapAcrossSections): its range is protected one allocation at a time.
+static bool SpansAllocations(uint64_t address, uint64_t size) {
+	MEMORY_BASIC_INFORMATION first {};
+	MEMORY_BASIC_INFORMATION last {};
+	return size != 0 && VirtualQuery(reinterpret_cast<LPCVOID>(address), &first, sizeof(first)) != 0 &&
+	       VirtualQuery(reinterpret_cast<LPCVOID>(address + size - 1), &last, sizeof(last)) != 0 &&
+	       first.AllocationBase != last.AllocationBase;
+}
+
+static bool ProtectPerAllocation(uint64_t address, uint64_t size, DWORD protection, DWORD* old_protect) {
+	for (uint64_t at = address, end = address + size; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<LPCVOID>(at), &info, sizeof(info)) == 0) return false;
+		const uint64_t next = std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+		DWORD          old  = 0;
+		if (next <= at || VirtualProtect(reinterpret_cast<LPVOID>(at), next - at, protection, &old) == 0) return false;
+		if (at == address) *old_protect = old;
+		at = next;
+	}
+	return true;
+}
+
 bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
                        VirtualMemory::Mode* old_mode) {
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {
-		printf("VirtualProtect() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
-		return false;
+		const auto error = GetLastError();
+		// (Other failures change nothing, as before.)
+		if (!SpansAllocations(address, size) ||
+		    !ProtectPerAllocation(address, size, GetProtectionFlag(mode), &old_protect)) {
+			printf("VirtualProtect() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
+			return false;
+		}
 	}
 	if (old_mode != nullptr) {
 		*old_mode = GetProtectionFlag(old_protect);
